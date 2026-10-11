@@ -14,4 +14,8 @@ game_root = "assets"
 [entrypoint]
 file_path = "assets/default.xex"
 out_directory_path = "generated/default"
-includes = ["rb2_functions.toml", "rb2_functions_extra.toml", "rb2_rexcrt.toml"]
+# rb2_rexcrt.toml (upstream's native heap and file hooks) is left out since 0.1.1: with it, 0.1.0
+# crashed after the autosave notice on every boot (a job thread read a null list in
+# sub_823ECE58). Without it the game runs its own recompiled heap and file code on the
+# SDK's kernel, which is slower but is what Xenia runs.
+includes = ["rb2_functions.toml", "rb2_functions_extra.toml"]

@@ -268,6 +268,36 @@ class ModManagerTest {
     }
 
     @Test
+    fun ps3CharacterFilesAreHeldBackAndTheOriginalsExported() {
+        val paths = listOf(
+            "battle/character/model/chara_067_2p_model_i.pak",
+            "battle/character/model/chara_067_2p_model_m.pak",
+        )
+        afs.writeBytes(buildAfs(paths.mapIndexed { i, _ -> "" to bytes(700 + i, 40 + i) }))
+        val original = afs.readBytes()
+        val index = File(root, PackIndex.FILE_NAME)
+        PackIndex.write(index, mapOf("st_pack_battle_character_pt_x360.afs" to paths))
+        val saves = File(root, "saves")
+        val save = File(saves, "P/DB_SAVE")
+        save.parentFile!!.mkdirs()
+        save.writeBytes(bytes(55000, 5))
+        val ps3 = "STPZ....067_brolly_0_2p_PS3.ioram".toByteArray() + bytes(100, 1)
+
+        val manager = ModManager(game, mods, saves, index)
+        val mod = manager.install(
+            zip(
+                "Moro/067_brolly_0_2p_i.zpak" to ps3,
+                "SaveData/Saves/Player/DB_SAVE" to bytes(55000, 6),
+            ),
+            "Moro.zip"
+        )
+        assertArrayEquals(original, afs.readBytes())
+        assertArrayEquals(bytes(55000, 6), save.readBytes())
+        assertEquals(1, mod.notes.size)
+        assertArrayEquals(bytes(700, 40), File(mods, "x360-originals/st_pack_battle_character-0.zpak").readBytes())
+    }
+
+    @Test
     fun characterModsWaitForTheGameToStartOnce() {
         val manager = ModManager(game, mods, null, File(root, PackIndex.FILE_NAME))
         try {

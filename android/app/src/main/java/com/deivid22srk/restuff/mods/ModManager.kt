@@ -85,6 +85,7 @@ class ModManager(
             val saves = findSaves()
             val changes = mutableListOf<Change>()
             val skipped = mutableListOf<Skipped>()
+            val ps3Slots = mutableListOf<Pair<String, Int>>()
             var saveTaken = false
             for (path in extracted) {
                 val match = matchFile(path, gameIndex)
@@ -109,6 +110,12 @@ class ModManager(
                             hits != null -> hits.forEach { (archive, entryName) ->
                                 changes += Change(Kind.AFS, archive, entryName, path)
                             }
+                            // PS3/PC character packs crash the Xbox 360 game (it can't read
+                            // them), so they're held back until they can be converted.
+                            slot != null && looksPs3(File(staging, path)) -> {
+                                skipped += Skipped(path, PS3_FORMAT)
+                                ps3Slots += slot
+                            }
                             slot != null -> changes += Change(Kind.AFS, slot.first, "#${slot.second}", path)
                             name.contains("_ps3", ignoreCase = true) ->
                                 skipped += Skipped(path, "PS3 file; this port uses the Xbox 360 data")
@@ -118,6 +125,13 @@ class ModManager(
                         }
                     }
                 }
+            }
+            exportOriginals(ps3Slots)
+            if (changes.isEmpty() && ps3Slots.isNotEmpty()) {
+                throw ModException(
+                    "This mod's character files are PS3/PC versions, and the Xbox 360 game can't load them " +
+                        "(it goes black or crashes), so nothing was installed."
+                )
             }
             if (changes.isEmpty() && skipped.any { it.reason == NO_INDEX }) {
                 throw ModException(
@@ -136,9 +150,9 @@ class ModManager(
             if (skipped.any { it.reason == NO_INDEX }) {
                 notes += "Character files were skipped: start the game once, then install this mod again for them."
             }
-            if (changes.any { it.kind == Kind.AFS && looksPs3(File(staging, it.stored)) }) {
-                notes += "These character files were made for the PS3/PC version. " +
-                    "If they look wrong or crash in game, remove the mod to get the originals back."
+            if (ps3Slots.isNotEmpty()) {
+                notes += "Its ${ps3Slots.size} character files were left out: they're PS3/PC versions, " +
+                    "which the Xbox 360 game can't load."
             }
             writeInstallReport(changes, staging)
 
@@ -312,6 +326,39 @@ class ModManager(
             return rel to slot.index
         }
         return null
+    }
+
+    /**
+     * Copies the game's own Xbox 360 files for [slots] (read from the
+     * untouched `.bk` when there is one) into `mods/x360-originals/`, so the
+     * PS3 and Xbox 360 versions of a character can be compared.
+     */
+    private fun exportOriginals(slots: List<Pair<String, Int>>) {
+        if (slots.isEmpty()) return
+        runCatching {
+            val out = File(modsDir, "x360-originals").apply { mkdirs() }
+            for ((rel, index) in slots) {
+                val live = File(gameRoot, rel)
+                val bk = File(live.path + BACKUP_SUFFIX)
+                val source = if (bk.exists()) bk else live
+                val entry = AfsArchive.open(source).entries.getOrNull(index) ?: continue
+                val target = File(out, "${live.name.substringBefore("_pt_")}-$index.zpak")
+                if (target.length() == entry.size) continue
+                java.io.RandomAccessFile(source, "r").use { raf ->
+                    raf.seek(entry.offset)
+                    target.outputStream().use { o ->
+                        val buf = ByteArray(1 shl 16)
+                        var left = entry.size
+                        while (left > 0) {
+                            val n = raf.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+                            if (n < 0) break
+                            o.write(buf, 0, n)
+                            left -= n
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /** True when a pack's own file names say it is PS3 data (`000_goku_0_2p_PS3.spr`). */
@@ -515,6 +562,7 @@ class ModManager(
     companion object {
         const val BACKUP_SUFFIX = ".bk"
         private const val UNMATCHED = "doesn't match any game file"
+        private const val PS3_FORMAT = "PS3/PC version; the Xbox 360 game can't load it"
         private const val NO_INDEX = "the game hasn't been started yet, so its character file list isn't known"
         private const val MB = 1024L * 1024L
         private const val SPACE_MARGIN = 64L * MB

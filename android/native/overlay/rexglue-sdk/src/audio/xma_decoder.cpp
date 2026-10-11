@@ -10,6 +10,7 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 
 #include <rex/audio/xma/context.h>
@@ -308,6 +309,25 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       }
     }
     work_event_->Set();
+
+    // RB2 audio bring-up: a heartbeat of how many contexts get kicked, so a
+    // log shows whether XMA playback is running at all.
+    static std::atomic<uint64_t> s_rb2_kicks{0};
+    static std::atomic<int64_t> s_rb2_last_report{0};
+    s_rb2_kicks += static_cast<uint64_t>(__builtin_popcount(register_file_[r]));
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    int64_t last = s_rb2_last_report.load(std::memory_order_relaxed);
+    if (now - last >= 5 && s_rb2_last_report.compare_exchange_strong(last, now)) {
+      uint32_t enabled = 0;
+      for (auto& context : contexts_) {
+        if (context.is_allocated()) {
+          ++enabled;
+        }
+      }
+      REXAPU_INFO("RB2XMA kicks total={} allocated_contexts={}", s_rb2_kicks.load(), enabled);
+    }
   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
     // Context lock command.
     // This requests a lock by flagging the context.

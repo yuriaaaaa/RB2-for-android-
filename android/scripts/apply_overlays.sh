@@ -73,6 +73,9 @@ for rel in \
     src/ui/vulkan/vulkan_device.cpp \
     src/ui/vulkan/vulkan_presenter.cpp \
     src/audio/xma_decoder.cpp \
+    src/audio/sdl/sdl_audio_driver.cpp \
+    src/kernel/xboxkrnl/xboxkrnl_io.cpp \
+    src/kernel/xboxkrnl/xboxkrnl_audio_xma.cpp \
     src/system/xthread.cpp \
     src/system/runtime.cpp \
     src/ui/rex_app.cpp \

@@ -74,6 +74,8 @@ import kotlinx.coroutines.withContext
 import com.deivid22srk.restuff.config.PortBranding
 import com.deivid22srk.restuff.data.GpuDriverManager
 import com.deivid22srk.restuff.game.EngineOverrides
+import com.deivid22srk.restuff.mods.ModManager
+import com.deivid22srk.restuff.mods.Mods
 import com.deivid22srk.restuff.settings.FpsLimitOption
 import com.deivid22srk.restuff.settings.PortSettings
 import com.deivid22srk.restuff.settings.PortSettingsViewModel
@@ -301,6 +303,11 @@ fun SettingsScreen(
                 enabled = selectionState.phase !is DataPhase.Idle,
                 onClick = onClearSelection
             )
+
+            SectionGap()
+
+            // ============================ MODS ===========================
+            ModsSection()
 
             SectionGap()
 
@@ -806,6 +813,191 @@ private fun DriversSection() {
                         color = accent,
                         style = PortType.caption
                     )
+                }
+            }
+        }
+
+        message?.let { msg ->
+            Spacer(Modifier.height(10.dp))
+            Text(
+                text = msg,
+                color = if (isError) PortPalette.error else PortPalette.success,
+                style = PortType.rowSub
+            )
+        }
+    }
+}
+
+// ======================================================================
+// Mods (.zip installed into the game folder, originals kept as .bk)
+// ======================================================================
+
+private val MOD_ZIP_MIME = arrayOf(
+    "application/zip",
+    "application/octet-stream",
+    "application/x-zip-compressed",
+)
+
+/**
+ * Installs zip mods into the game folder. A file the mod replaces is kept as
+ * `<name>.bk` first; character files (.zpak) are swapped inside the game's AFS
+ * archives. Removing a mod restores what it changed.
+ */
+@Composable
+private fun ModsSection() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val accent = PortBranding.config.accent
+
+    var manager by remember { mutableStateOf<ModManager?>(null) }
+    var installed by remember { mutableStateOf<List<ModManager.InstalledMod>>(emptyList()) }
+    var busy by remember { mutableStateOf<String?>(null) }
+    var message by remember { mutableStateOf<String?>(null) }
+    var isError by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        val m = withContext(Dispatchers.IO) { Mods.manager(context) }
+        manager = m
+        installed = withContext(Dispatchers.IO) { runCatching { m?.list() }.getOrNull() ?: emptyList() }
+    }
+
+    val zipPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        val m = manager
+        if (uri == null || m == null) return@rememberLauncherForActivityResult
+        val name = Mods.displayName(context, uri)
+        if (!name.endsWith(".zip", ignoreCase = true)) {
+            message = "Only .zip mods can be installed for now. Extract “$name” and zip it again."
+            isError = true
+            return@rememberLauncherForActivityResult
+        }
+        busy = "Installing $name…"
+        message = null
+        scope.launch {
+            try {
+                val mod = withContext(Dispatchers.IO) {
+                    val input = context.contentResolver.openInputStream(uri)
+                        ?: throw ModManager.ModException("Couldn't open $name.")
+                    input.use { m.install(it, name) { line -> scope.launch { busy = line } } }
+                }
+                installed = withContext(Dispatchers.IO) { m.list() }
+                val files = mod.changes.size
+                message = "Installed “${mod.name}”: $files file" + (if (files == 1) "" else "s") +
+                    " replaced, originals kept as .bk." +
+                    (if (mod.skipped.isEmpty()) "" else " Skipped ${mod.skipped.size}: " +
+                        mod.skipped.take(3).joinToString("; ") { "${it.path.substringAfterLast('/')} (${it.reason})" })
+                isError = false
+            } catch (e: Exception) {
+                message = e.message ?: "Couldn't install the mod."
+                isError = true
+            }
+            busy = null
+        }
+    }
+
+    Column {
+        SectionHeader("Mods")
+
+        Text(
+            text = "Install a mod from a .zip. Files it replaces in your game folder are kept " +
+                "as .bk backups, and character files (.zpak) are swapped inside the game's " +
+                ".afs packs. Remove a mod to put the originals back. Mods made for the " +
+                "PS3 version don't work here.",
+            color = PortPalette.textSecondary,
+            style = PortType.rowSub
+        )
+
+        Spacer(Modifier.height(14.dp))
+
+        val m = manager
+        if (m == null) {
+            Text(
+                text = "Mods need the extracted game folder. They can't be installed while " +
+                    "the game starts straight from an ISO.",
+                color = PortPalette.textTertiary,
+                style = PortType.rowSub
+            )
+        } else {
+            installed.forEach { mod ->
+                DriverOptionRow(
+                    title = mod.name,
+                    subtitle = mod.changes.map { it.entry ?: it.target.substringAfterLast('/') }
+                        .distinct().take(4).joinToString(" · ") +
+                        if (mod.changes.size > 4) " · +${mod.changes.size - 4} more" else "",
+                    selected = true,
+                    onSelect = {},
+                    onDelete = {
+                        if (busy != null) return@DriverOptionRow
+                        busy = "Removing ${mod.name}…"
+                        message = null
+                        scope.launch {
+                            try {
+                                withContext(Dispatchers.IO) {
+                                    m.uninstall(mod.id) { line -> scope.launch { busy = line } }
+                                }
+                                message = "Removed “${mod.name}” and restored the original files."
+                                isError = false
+                            } catch (e: Exception) {
+                                message = e.message ?: "Couldn't remove the mod."
+                                isError = true
+                            }
+                            installed = withContext(Dispatchers.IO) {
+                                runCatching { m.list() }.getOrDefault(emptyList())
+                            }
+                            busy = null
+                        }
+                    }
+                )
+                Hairline()
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .clip(RoundedCornerShape(PortPalette.radiusSm))
+                    .border(
+                        1.dp,
+                        accent.copy(alpha = if (busy != null) 0.2f else 0.55f),
+                        RoundedCornerShape(PortPalette.radiusSm)
+                    )
+                    .portClickable(enabled = busy == null) { zipPicker.launch(MOD_ZIP_MIME) }
+                    .padding(horizontal = 16.dp, vertical = 13.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    val status = busy
+                    if (status != null) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(15.dp),
+                            strokeWidth = 2.dp,
+                            color = accent
+                        )
+                        Text(
+                            text = status,
+                            color = accent.copy(alpha = 0.7f),
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Filled.Add,
+                            contentDescription = null,
+                            tint = accent,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = "Install mod (.zip)",
+                            color = accent,
+                            style = PortType.caption
+                        )
+                    }
                 }
             }
         }

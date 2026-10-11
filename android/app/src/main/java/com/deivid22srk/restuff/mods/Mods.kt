@@ -19,7 +19,7 @@ object Mods {
         if (!gameRoot.isDirectory) return null
         // Next to the game folder ("Raging Blast 2/mods"), so it survives reinstalls.
         val modsDir = File(gameRoot.absoluteFile.parentFile ?: context.filesDir, "mods")
-        return ModManager(gameRoot, modsDir)
+        return ModManager(gameRoot, modsDir, GamePaths.savesDir(context))
     }
 
     fun displayName(context: Context, uri: Uri): String {

@@ -882,9 +882,11 @@ private fun ModsSection() {
                     input.use { m.install(it, name) { line -> scope.launch { busy = line } } }
                 }
                 installed = withContext(Dispatchers.IO) { m.list() }
-                val files = mod.changes.size
+                val files = mod.changes.count { it.kind != ModManager.Kind.SAVE }
+                val save = mod.changes.any { it.kind == ModManager.Kind.SAVE }
                 message = "Installed “${mod.name}”: $files file" + (if (files == 1) "" else "s") +
                     " replaced, originals kept as .bk." +
+                    (if (save) " Your save was replaced too; the old one is kept as DB_SAVE.bk." else "") +
                     (if (mod.skipped.isEmpty()) "" else " Skipped ${mod.skipped.size}: " +
                         mod.skipped.take(3).joinToString("; ") { "${it.path.substringAfterLast('/')} (${it.reason})" })
                 isError = false

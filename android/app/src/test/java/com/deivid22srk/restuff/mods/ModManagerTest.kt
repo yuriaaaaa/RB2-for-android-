@@ -152,6 +152,66 @@ class ModManagerTest {
         assertFalse(File(root, "evil.zpak").exists())
     }
 
+    @Test
+    fun readsAndPatchesBigEndianArchives() {
+        // Xbox 360 data: a big-endian count must not be taken for a little-endian one.
+        val entries = (0 until 300).map { "%03d_chara_0_2p_i.zpak".format(it) to bytes(100 + it, it) }
+        afs.writeBytes(buildAfs(entries, ByteOrder.BIG_ENDIAN))
+        val archive = AfsArchive.open(afs)
+        assertEquals(ByteOrder.BIG_ENDIAN, archive.order)
+        assertEquals(300, archive.entries.size)
+        assertEquals("042_chara_0_2p_i.zpak", archive.entries[42].name)
+
+        val manager = ModManager(game, mods)
+        manager.install(zip("Modloader/Characters/X/042_chara_0_2p_i.zpak" to bytes(5000, 99)), "BE.zip")
+        assertArrayEquals(bytes(5000, 99), entryBytes(AfsArchive.open(afs), "042_chara_0_2p_i.zpak"))
+        assertArrayEquals(bytes(143, 43), entryBytes(AfsArchive.open(afs), "043_chara_0_2p_i.zpak"))
+    }
+
+    @Test
+    fun replacesTheSaveAndRestoresIt() {
+        val saves = File(root, "saves")
+        val save = File(saves, "E0000ABCD/4E4D0826/00000001/RB2SAVE/DB_SAVE")
+        save.parentFile!!.mkdirs()
+        save.writeBytes(bytes(55000, 5))
+        val manager = ModManager(game, mods, saves)
+        val mod = manager.install(
+            zip(
+                "SaveData/Saves/Player/DB_SAVE" to bytes(55000, 6),
+                "assets/DB_SAVE" to bytes(55000, 6),
+                "Modloader/Characters/Goku/000_goku_0_2p_v.zpak" to bytes(800, 7),
+            ),
+            "Modpack.zip"
+        )
+        assertArrayEquals(bytes(55000, 6), save.readBytes())
+        assertArrayEquals(bytes(55000, 5), File(save.path + ".bk").readBytes())
+        assertEquals(1, mod.changes.count { it.kind == ModManager.Kind.SAVE })
+
+        manager.uninstall(mod.id)
+        assertArrayEquals(bytes(55000, 5), save.readBytes())
+        assertFalse(File(save.path + ".bk").exists())
+        assertArrayEquals(originalAfs, afs.readBytes())
+    }
+
+    @Test
+    fun characterFilesMissingFromThePacksStopTheInstall() {
+        val manager = ModManager(game, mods)
+        try {
+            manager.install(
+                zip(
+                    "Modloader/Characters/Goku/000_goku_0_2p_i.zpak" to bytes(10, 1),
+                    "Modloader/Characters/Moro/067_brolly_0_2p_i.zpak" to bytes(10, 1),
+                ),
+                "Partial.zip"
+            )
+            fail("expected ModException")
+        } catch (e: ModManager.ModException) {
+            assertTrue(e.message!!.contains("067_brolly_0_2p_i.zpak"))
+        }
+        assertArrayEquals(originalAfs, afs.readBytes())
+        assertTrue(File(mods, "pack-report.txt").readText().contains("3 entries, 3 named"))
+    }
+
     // ------------------------------------------------------------------
 
     private fun bytes(n: Int, seed: Int) = ByteArray(n) { ((it * 31 + seed * 7) and 0xFF).toByte() }
@@ -179,14 +239,17 @@ class ModManagerTest {
     }
 
     /** A little-endian AFS with 2048-byte alignment and the name table after the data. */
-    private fun buildAfs(entries: List<Pair<String, ByteArray>>): ByteArray {
+    private fun buildAfs(
+        entries: List<Pair<String, ByteArray>>,
+        order: ByteOrder = ByteOrder.LITTLE_ENDIAN,
+    ): ByteArray {
         fun align(v: Int) = (v + 2047) / 2048 * 2048
         val count = entries.size
         var offset = align(8 + count * 8 + 8)
         val offsets = entries.map { (_, data) -> offset.also { offset = align(offset + data.size) } }
         val nameTable = offset
         val total = align(nameTable + count * 48)
-        val buf = ByteBuffer.allocate(total).order(ByteOrder.LITTLE_ENDIAN)
+        val buf = ByteBuffer.allocate(total).order(order)
         buf.put("AFS".toByteArray()).put(0).putInt(count)
         entries.forEachIndexed { i, (_, data) -> buf.putInt(offsets[i]).putInt(data.size) }
         buf.putInt(nameTable).putInt(count * 48)

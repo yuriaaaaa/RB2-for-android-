@@ -101,77 +101,111 @@ class AfsArchive private constructor(
             }
         }.getOrDefault(false)
 
+        /**
+         * Parses [file]. The Xbox 360 packs may be big-endian, and a big-endian
+         * count read as little-endian can still look plausible, so each byte
+         * order gets a full parse and the first that holds together wins
+         * (preferring one whose entries have names).
+         */
         fun open(file: File): AfsArchive {
             RandomAccessFile(file, "r").use { raf ->
                 val length = raf.length()
                 if (length < 16) throw FormatException("${file.name} is too small to be an AFS archive")
-                val head = ByteArray(8)
+                val head = ByteArray(4)
                 raf.readFully(head)
                 if (head[0] != 'A'.code.toByte() || head[1] != 'F'.code.toByte() ||
                     head[2] != 'S'.code.toByte() || head[3] != 0.toByte()
                 ) {
                     throw FormatException("${file.name} is not an AFS archive")
                 }
-                val order = listOf(ByteOrder.LITTLE_ENDIAN, ByteOrder.BIG_ENDIAN).firstOrNull { o ->
-                    val count = ByteBuffer.wrap(head, 4, 4).order(o).int.toLong() and 0xFFFFFFFFL
-                    count in 1..MAX_ENTRIES && 8 + count * 8 + 8 <= length
-                } ?: throw FormatException("${file.name}: unreadable entry count")
-                val count = (ByteBuffer.wrap(head, 4, 4).order(order).int.toLong() and 0xFFFFFFFFL).toInt()
-
-                val toc = ByteArray(count * 8 + 8)
-                raf.seek(8)
-                raf.readFully(toc)
-                val tb = ByteBuffer.wrap(toc).order(order)
-                val offsets = LongArray(count)
-                val sizes = LongArray(count)
-                for (i in 0 until count) {
-                    offsets[i] = tb.int.toLong() and 0xFFFFFFFFL
-                    sizes[i] = tb.int.toLong() and 0xFFFFFFFFL
-                    if (offsets[i] + sizes[i] > length) {
-                        throw FormatException("${file.name}: entry $i runs past the end of the file")
-                    }
-                }
-
-                var ntOffset = tb.int.toLong() and 0xFFFFFFFFL
-                var ntSize = tb.int.toLong() and 0xFFFFFFFFL
-                if (!plausibleNameTable(ntOffset, ntSize, count, length)) {
-                    val firstData = offsets.filter { it > 0 }.minOrNull() ?: 0L
-                    if (firstData >= 8) {
-                        val alt = ByteArray(8)
-                        raf.seek(firstData - 8)
-                        raf.readFully(alt)
-                        val ab = ByteBuffer.wrap(alt).order(order)
-                        ntOffset = ab.int.toLong() and 0xFFFFFFFFL
-                        ntSize = ab.int.toLong() and 0xFFFFFFFFL
-                    }
-                }
-                val names = Array(count) { "" }
-                if (plausibleNameTable(ntOffset, ntSize, count, length)) {
-                    val table = ByteArray(count * NAME_RECORD)
-                    raf.seek(ntOffset)
-                    raf.readFully(table)
-                    for (i in 0 until count) {
-                        var end = i * NAME_RECORD
-                        val limit = end + 32
-                        while (end < limit && table[end] != 0.toByte()) end++
-                        names[i] = String(table, i * NAME_RECORD, end - i * NAME_RECORD, Charsets.ISO_8859_1)
-                    }
-                } else {
-                    ntOffset = 0
-                    ntSize = 0
-                }
-
-                val nonEmpty = offsets.filter { it > 0 }
-                val alignment = when {
-                    nonEmpty.isEmpty() -> 2048
-                    nonEmpty.all { it % 2048 == 0L } -> 2048
-                    nonEmpty.all { it % 32 == 0L } -> 32
-                    else -> 4
-                }
-                val entries = (0 until count).map { Entry(it, names[it], offsets[it], sizes[it]) }
-                return AfsArchive(file, order, entries, ntOffset, ntSize, alignment)
+                val parsed = listOf(ByteOrder.BIG_ENDIAN, ByteOrder.LITTLE_ENDIAN)
+                    .mapNotNull { runCatching { parse(file, raf, it) }.getOrNull() }
+                return parsed.firstOrNull { a -> a.entries.any { it.name.isNotEmpty() } }
+                    ?: parsed.firstOrNull()
+                    ?: throw FormatException("${file.name}: unreadable AFS table of contents")
             }
         }
+
+        private fun parse(file: File, raf: RandomAccessFile, order: ByteOrder): AfsArchive {
+            val length = raf.length()
+            val countBytes = ByteArray(4)
+            raf.seek(4)
+            raf.readFully(countBytes)
+            val count = ByteBuffer.wrap(countBytes).order(order).int.toLong() and 0xFFFFFFFFL
+            if (count !in 1..MAX_ENTRIES || 8 + count * 8 + 8 > length) {
+                throw FormatException("${file.name}: implausible entry count $count")
+            }
+            val n = count.toInt()
+            val toc = ByteArray(n * 8 + 8)
+            raf.seek(8)
+            raf.readFully(toc)
+            val tb = ByteBuffer.wrap(toc).order(order)
+            val offsets = LongArray(n)
+            val sizes = LongArray(n)
+            val tocEnd = 8L + n * 8L
+            for (i in 0 until n) {
+                offsets[i] = tb.int.toLong() and 0xFFFFFFFFL
+                sizes[i] = tb.int.toLong() and 0xFFFFFFFFL
+                val empty = offsets[i] == 0L && sizes[i] == 0L
+                if (!empty && (offsets[i] < tocEnd || offsets[i] + sizes[i] > length)) {
+                    throw FormatException("${file.name}: entry $i is outside the file")
+                }
+            }
+
+            var ntOffset = tb.int.toLong() and 0xFFFFFFFFL
+            var ntSize = tb.int.toLong() and 0xFFFFFFFFL
+            if (!plausibleNameTable(ntOffset, ntSize, n, length)) {
+                val firstData = offsets.filter { it > 0 }.minOrNull() ?: 0L
+                if (firstData >= tocEnd + 8) {
+                    val alt = ByteArray(8)
+                    raf.seek(firstData - 8)
+                    raf.readFully(alt)
+                    val ab = ByteBuffer.wrap(alt).order(order)
+                    ntOffset = ab.int.toLong() and 0xFFFFFFFFL
+                    ntSize = ab.int.toLong() and 0xFFFFFFFFL
+                }
+            }
+            val names = Array(n) { "" }
+            if (plausibleNameTable(ntOffset, ntSize, n, length)) {
+                val table = ByteArray(n * NAME_RECORD)
+                raf.seek(ntOffset)
+                raf.readFully(table)
+                for (i in 0 until n) {
+                    var end = i * NAME_RECORD
+                    val limit = end + 32
+                    while (end < limit && table[end] != 0.toByte()) end++
+                    names[i] = String(table, i * NAME_RECORD, end - i * NAME_RECORD, Charsets.ISO_8859_1)
+                }
+                // A table of control characters is not a name table.
+                if (names.any { name -> name.any { it.code < 0x20 } }) names.fill("")
+            } else {
+                ntOffset = 0
+                ntSize = 0
+            }
+            if (names.all { it.isEmpty() }) {
+                ntOffset = 0
+                ntSize = 0
+            }
+
+            val nonEmpty = offsets.filter { it > 0 }
+            val alignment = when {
+                nonEmpty.isEmpty() -> 2048
+                nonEmpty.all { it % 2048 == 0L } -> 2048
+                nonEmpty.all { it % 32 == 0L } -> 32
+                else -> 4
+            }
+            val entries = (0 until n).map { Entry(it, names[it], offsets[it], sizes[it]) }
+            return AfsArchive(file, order, entries, ntOffset, ntSize, alignment)
+        }
+
+        /** First bytes of [file] in hex, for a report when a pack can't be read. */
+        fun headerHex(file: File, bytes: Int = 64): String = runCatching {
+            RandomAccessFile(file, "r").use { raf ->
+                val b = ByteArray(minOf(bytes.toLong(), raf.length()).toInt())
+                raf.readFully(b)
+                b.joinToString(" ") { "%02x".format(it) }
+            }
+        }.getOrDefault("unreadable")
 
         private fun plausibleNameTable(offset: Long, size: Long, count: Int, length: Long): Boolean =
             offset > 0 && size >= count.toLong() * NAME_RECORD && offset + count.toLong() * NAME_RECORD <= length

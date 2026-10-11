@@ -23,8 +23,8 @@ class AfsArchive private constructor(
     private val file: File,
     val order: ByteOrder,
     val entries: List<Entry>,
-    private val nameTableOffset: Long,
-    private val nameTableSize: Long,
+    val nameTableOffset: Long,
+    val nameTableSize: Long,
     val alignment: Int,
 ) {
 
@@ -34,6 +34,18 @@ class AfsArchive private constructor(
 
     /** Entry names are matched without case, as mods made on Windows don't keep it. */
     fun find(name: String): Entry? = entries.firstOrNull { it.name.equals(name, ignoreCase = true) }
+        ?: entries.firstOrNull { baseName(it.name).equals(baseName(name), ignoreCase = true) }
+
+    /** Raw bytes of the name table's first [records] records, for the pack report. */
+    fun nameTableHex(records: Int = 3): String = runCatching {
+        if (nameTableOffset <= 0) return@runCatching "none"
+        RandomAccessFile(file, "r").use { raf ->
+            val b = ByteArray(minOf(records * NAME_RECORD.toLong(), raf.length() - nameTableOffset).toInt())
+            raf.seek(nameTableOffset)
+            raf.readFully(b)
+            b.joinToString(" ") { "%02x".format(it) }
+        }
+    }.getOrDefault("unreadable")
 
     /** Writes [data] as entry [index]; returns where it ended up. */
     fun replace(index: Int, data: File): Entry {
@@ -91,6 +103,9 @@ class AfsArchive private constructor(
     companion object {
         private const val NAME_RECORD = 48
         private const val MAX_ENTRIES = 1_000_000
+
+        /** Name without any folder part, as packs may store paths. */
+        fun baseName(name: String): String = name.substringAfterLast('/').substringAfterLast('\\')
 
         fun isAfs(file: File): Boolean = runCatching {
             RandomAccessFile(file, "r").use { raf ->

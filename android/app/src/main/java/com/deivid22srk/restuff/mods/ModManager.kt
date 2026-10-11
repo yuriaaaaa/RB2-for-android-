@@ -266,7 +266,8 @@ class ModManager(
             val archive = result.getOrNull() ?: continue
             for (entry in archive.entries) {
                 if (entry.name.isEmpty()) continue
-                index.getOrPut(entry.name.lowercase()) { mutableListOf() } += rel to entry.name
+                index.getOrPut(AfsArchive.baseName(entry.name).lowercase()) { mutableListOf() } +=
+                    rel to entry.name
             }
         }
         return index
@@ -301,8 +302,16 @@ class ModManager(
         runCatching {
             modsDir.mkdirs()
             File(modsDir, "pack-report.txt").writeText(buildString {
-                for ((rel, _) in packs) {
+                for ((rel, result) in packs) {
                     appendLine("$rel header: ${AfsArchive.headerHex(File(gameRoot, rel))}")
+                    val a = result.getOrNull() ?: continue
+                    appendLine("  name table at ${a.nameTableOffset} size ${a.nameTableSize}")
+                    appendLine("  first records: ${a.nameTableHex()}")
+                    appendLine("  first names: " + a.entries.take(12).joinToString(" | ") { it.name })
+                    val goku = a.entries.filter { it.name.contains("goku", ignoreCase = true) }.take(12)
+                    if (goku.isNotEmpty()) {
+                        appendLine("  goku names: " + goku.joinToString(" | ") { "${it.index}:${it.name}" })
+                    }
                 }
                 lines.forEach { appendLine(it) }
             })

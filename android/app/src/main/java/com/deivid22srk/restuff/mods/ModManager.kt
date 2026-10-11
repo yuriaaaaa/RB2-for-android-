@@ -12,8 +12,10 @@ import java.util.zip.ZipInputStream
  *  - FILE: its path ends with the path of a file in the game folder
  *    (`data/X360/st_pack_sound_pt_x360.afs`, `movie/xyz.wmv`, ...). The game
  *    file is replaced.
- *  - AFS: its name is an entry inside one of the game's AFS archives
- *    (`000_goku_0_2p_i.zpak` lives in st_pack_battle_character_pt_x360.afs).
+ *  - AFS: it stands for an entry inside one of the game's AFS archives. The
+ *    Xbox 360 packs have no entry names, so [PackIndex] turns the mod's name
+ *    (`067_brolly_0_2p_i.zpak`) into the path the game asks for
+ *    (`battle/character/model/chara_067_2p_model_i.pak`) and finds its slot.
  *    That entry is replaced inside the archive.
  *
  * Before a game file is changed for the first time, the original is kept next
@@ -29,6 +31,7 @@ class ModManager(
     private val gameRoot: File,
     private val modsDir: File,
     private val savesDir: File? = null,
+    private val packIndexFile: File? = null,
 ) {
 
     enum class Kind { FILE, AFS, SAVE }
@@ -43,6 +46,8 @@ class ModManager(
         val name: String,
         val changes: List<Change>,
         val skipped: List<Skipped>,
+        /** Warnings for the person installing; not kept in the records. */
+        val notes: List<String> = emptyList(),
     )
 
     class ModException(message: String) : IOException(message)
@@ -76,6 +81,7 @@ class ModManager(
             val gameIndex = indexGameFiles()
             val packs = readPacks(gameIndex.values)
             val afsIndex = indexAfsEntries(packs)
+            val packIndex = packIndexFile?.let { PackIndex.read(it) }
             val saves = findSaves()
             val changes = mutableListOf<Change>()
             val skipped = mutableListOf<Skipped>()
@@ -98,26 +104,25 @@ class ModManager(
                     else -> {
                         val name = path.substringAfterLast('/')
                         val hits = afsIndex[name.lowercase()]
+                        val slot = if (hits == null) locateSlot(path, packIndex, packs) else null
                         when {
                             hits != null -> hits.forEach { (archive, entryName) ->
                                 changes += Change(Kind.AFS, archive, entryName, path)
                             }
+                            slot != null -> changes += Change(Kind.AFS, slot.first, "#${slot.second}", path)
                             name.contains("_ps3", ignoreCase = true) ->
                                 skipped += Skipped(path, "PS3 file; this port uses the Xbox 360 data")
+                            name.endsWith(".zpak", ignoreCase = true) && packIndex == null ->
+                                skipped += Skipped(path, NO_INDEX)
                             else -> skipped += Skipped(path, UNMATCHED)
                         }
                     }
                 }
             }
-            val unmatchedPacked = skipped.filter {
-                it.reason == UNMATCHED && it.path.endsWith(".zpak", ignoreCase = true)
-            }
-            if (unmatchedPacked.isNotEmpty()) {
-                // Half a character mod is worse than none: stop before touching anything.
-                val report = writePackReport(packs)
-                val why = unmatchedPacked.take(4).joinToString("\n") { "• ${it.path}" }
+            if (changes.isEmpty() && skipped.any { it.reason == NO_INDEX }) {
                 throw ModException(
-                    "These character files aren't in any of the game's .afs packs:\n$why\n$report"
+                    "Start the game once (to the title screen is enough), then install this mod again. " +
+                        "The game tells the launcher where its character files live when it starts."
                 )
             }
             if (changes.isEmpty()) {
@@ -127,12 +132,21 @@ class ModManager(
             }
 
             checkSpace(changes, staging)
+            val notes = mutableListOf<String>()
+            if (skipped.any { it.reason == NO_INDEX }) {
+                notes += "Character files were skipped: start the game once, then install this mod again for them."
+            }
+            if (changes.any { it.kind == Kind.AFS && looksPs3(File(staging, it.stored)) }) {
+                notes += "These character files were made for the PS3/PC version. " +
+                    "If they look wrong or crash in game, remove the mod to get the originals back."
+            }
+            writeInstallReport(changes, staging)
 
             val stored = File(modsDir, id)
             stored.deleteRecursively()
             if (!staging.renameTo(stored)) throw ModException("Couldn't store the mod's files.")
 
-            val mod = InstalledMod(id, displayName, changes, skipped)
+            val mod = InstalledMod(id, displayName, changes, skipped, notes)
             val touched = mutableListOf<String>()
             try {
                 for ((target, targetChanges) in changes.groupBy { it.target }) {
@@ -196,9 +210,13 @@ class ModManager(
             Kind.FILE, Kind.SAVE -> copyAtomically(source, target)
             Kind.AFS -> {
                 val archive = AfsArchive.open(target)
-                val entry = archive.find(change.entry!!)
-                    ?: throw ModException("${change.entry} is no longer in ${change.target}.")
-                archive.replace(entry.index, source)
+                val name = change.entry!!
+                val index = if (name.startsWith("#")) {
+                    name.drop(1).toIntOrNull()?.takeIf { it in archive.entries.indices }
+                } else {
+                    archive.find(name)?.index
+                } ?: throw ModException("$name is no longer in ${change.target}.")
+                archive.replace(index, source)
             }
         }
     }
@@ -272,6 +290,72 @@ class ModManager(
         }
         return index
     }
+
+    /**
+     * The (archive, entry index) the game reads [path] from, by way of the
+     * game's own path hashes. The archive must have as many entries as the
+     * game expects, or the index would point at the wrong file.
+     */
+    private fun locateSlot(
+        path: String,
+        packIndex: PackIndex?,
+        packs: Map<String, Result<AfsArchive>>,
+    ): Pair<String, Int>? {
+        packIndex ?: return null
+        for (logical in PackIndex.candidates(path)) {
+            val slot = packIndex.locate(logical) ?: continue
+            val (rel, archive) = packs.entries.firstOrNull { (rel, _) ->
+                rel.substringAfterLast('/').equals(slot.pack, ignoreCase = true)
+            } ?: continue
+            val entries = archive.getOrNull()?.entries ?: continue
+            if (entries.size != packIndex.entryCount(slot.pack)) continue
+            return rel to slot.index
+        }
+        return null
+    }
+
+    /** True when a pack's own file names say it is PS3 data (`000_goku_0_2p_PS3.spr`). */
+    private fun looksPs3(file: File): Boolean = runCatching {
+        val head = ByteArray(minOf(512L, file.length()).toInt())
+        file.inputStream().use { it.read(head) }
+        String(head, Charsets.ISO_8859_1).contains("_PS3.")
+    }.getOrDefault(false)
+
+    /**
+     * Writes `install-report.txt`: for each pack entry the mod replaces, the
+     * first bytes of the game's original and of the mod's file, so a format
+     * mismatch can be spotted.
+     */
+    private fun writeInstallReport(changes: List<Change>, staging: File) {
+        runCatching {
+            File(modsDir, "install-report.txt").writeText(buildString {
+                for (c in changes) {
+                    appendLine("${c.kind} ${c.target} ${c.entry ?: ""} <- ${c.stored}")
+                    if (c.kind != Kind.AFS) continue
+                    val file = File(gameRoot, c.target)
+                    val archive = AfsArchive.open(file)
+                    val name = c.entry!!
+                    val entry = if (name.startsWith("#")) archive.entries.getOrNull(name.drop(1).toInt())
+                    else archive.find(name)
+                    if (entry != null) {
+                        appendLine("  original: ${entry.size} bytes: ${headDump(file, entry.offset, 96)}")
+                    }
+                    val mod = File(staging, c.stored)
+                    appendLine("  mod: ${mod.length()} bytes: ${headDump(mod, 0, 96)}")
+                }
+            })
+        }
+    }
+
+    private fun headDump(file: File, offset: Long, n: Int): String = runCatching {
+        java.io.RandomAccessFile(file, "r").use { raf ->
+            val b = ByteArray(minOf(n.toLong(), raf.length() - offset).toInt())
+            raf.seek(offset)
+            raf.readFully(b)
+            b.joinToString(" ") { "%02x".format(it) } + "  |" +
+                b.map { val c = it.toInt() and 0xFF; if (c in 32..126) c.toChar() else '.' }.joinToString("") + "|"
+        }
+    }.getOrDefault("unreadable")
 
     /** Every DB_SAVE in the saves folder, relative to it (one per profile). */
     private fun findSaves(): List<String> {
@@ -431,6 +515,7 @@ class ModManager(
     companion object {
         const val BACKUP_SUFFIX = ".bk"
         private const val UNMATCHED = "doesn't match any game file"
+        private const val NO_INDEX = "the game hasn't been started yet, so its character file list isn't known"
         private const val MB = 1024L * 1024L
         private const val SPACE_MARGIN = 64L * MB
         private val JUNK_EXTENSIONS = listOf(

@@ -19,7 +19,9 @@ object Mods {
         if (!gameRoot.isDirectory) return null
         // Next to the game folder ("Raging Blast 2/mods"), so it survives reinstalls.
         val modsDir = File(gameRoot.absoluteFile.parentFile ?: context.filesDir, "mods")
-        return ModManager(gameRoot, modsDir, GamePaths.savesDir(context))
+        // The game writes pack-hashes.bin next to the saves folder when it starts.
+        val packIndex = File(GamePaths.savesDir(context).parentFile ?: context.filesDir, PackIndex.FILE_NAME)
+        return ModManager(gameRoot, modsDir, GamePaths.savesDir(context), packIndex)
     }
 
     fun displayName(context: Context, uri: Uri): String {

@@ -194,30 +194,99 @@ class ModManagerTest {
     }
 
     @Test
-    fun characterFilesMissingFromThePacksStopTheInstall() {
-        val manager = ModManager(game, mods)
+    fun characterFilesNotInThePacksAreSkipped() {
+        val saves = File(root, "saves")
+        val save = File(saves, "E0000ABCD/4E4D0826/00000001/RB2SAVE/DB_SAVE")
+        save.parentFile!!.mkdirs()
+        save.writeBytes(bytes(55000, 5))
+        val manager = ModManager(game, mods, saves)
+        val mod = manager.install(
+            zip(
+                "Modloader/Characters/Moro/067_brolly_0_2p_i.zpak" to bytes(10, 1),
+                "SaveData/Saves/Player/DB_SAVE" to bytes(55000, 6),
+            ),
+            "Partial.zip"
+        )
+        // The save still goes in even though the character file has nowhere to go.
+        assertArrayEquals(bytes(55000, 6), save.readBytes())
+        assertEquals(listOf("Modloader/Characters/Moro/067_brolly_0_2p_i.zpak"), mod.skipped.map { it.path })
+        assertArrayEquals(originalAfs, afs.readBytes())
+    }
+
+    @Test
+    fun hashMatchesTheGame() {
+        // Value from the game's own table (st_pack_battle_character, entry 4403).
+        assertEquals(0x7ed16ae8, PackIndex.hash("battle/character/model/chara_000_2p_model_i.pak"))
+        assertEquals(
+            "battle/character/model/chara_067_2p_model_m.pak",
+            PackIndex.candidates("Modloader/Characters/Moro/067_brolly_0_2p_s.zpak").first()
+        )
+        assertEquals(
+            "battle/character/model/chara_094_D_3p_model_v.pak",
+            PackIndex.candidates("x/094_android_14_D_3p_v.zpak").first()
+        )
+    }
+
+    @Test
+    fun installsIntoUnnamedPacksThroughTheGamesPathHashes() {
+        // The Xbox 360 packs: no names, entries found by the game's path hashes.
+        val paths = listOf(
+            "battle/character/model/chara_000_2p_model_i.pak",
+            "battle/character/model/chara_000_2p_model_m.pak",
+            "battle/character/model/chara_000_2p_model_v.pak",
+            "battle/character/model/chara_067_2p_model_i.pak",
+            "battle/character/model/chara_067_2p_model_m.pak",
+            "battle/character/model/chara_067_2p_model_v.pak",
+        )
+        afs.writeBytes(buildAfs(paths.mapIndexed { i, _ -> "" to bytes(700 + i, 40 + i) }))
+        val original = afs.readBytes()
+        val index = File(root, PackIndex.FILE_NAME)
+        PackIndex.write(index, mapOf(
+            "st_pack_boot_pt_x360.afs" to listOf("boot/x.pak"),
+            "st_pack_battle_character_pt_x360.afs" to paths,
+        ))
+
+        val manager = ModManager(game, mods, null, index)
+        val mod = manager.install(
+            zip(
+                "Modloader/Characters/Moro/067_brolly_0_2p_i.zpak" to bytes(3000, 1),
+                "Modloader/Characters/Moro/067_brolly_0_2p_s.zpak" to bytes(300, 2),
+                "Modloader/Characters/Moro/067_brolly_0_2p_v.zpak" to bytes(5000, 3),
+            ),
+            "Moro.zip"
+        )
+        assertEquals(listOf("#3", "#4", "#5"), mod.changes.map { it.entry })
+        val archive = AfsArchive.open(afs)
+        assertArrayEquals(bytes(3000, 1), entryBytes(archive, 3))
+        assertArrayEquals(bytes(300, 2), entryBytes(archive, 4))
+        assertArrayEquals(bytes(5000, 3), entryBytes(archive, 5))
+        assertArrayEquals(bytes(700, 40), entryBytes(archive, 0))
+        assertTrue(File(mods, "install-report.txt").readText().contains("original: 703 bytes"))
+
+        manager.uninstall(mod.id)
+        assertArrayEquals(original, afs.readBytes())
+    }
+
+    @Test
+    fun characterModsWaitForTheGameToStartOnce() {
+        val manager = ModManager(game, mods, null, File(root, PackIndex.FILE_NAME))
         try {
-            manager.install(
-                zip(
-                    "Modloader/Characters/Goku/000_goku_0_2p_i.zpak" to bytes(10, 1),
-                    "Modloader/Characters/Moro/067_brolly_0_2p_i.zpak" to bytes(10, 1),
-                ),
-                "Partial.zip"
-            )
+            manager.install(zip("Moro/067_brolly_0_2p_i.zpak" to bytes(10, 1)), "Moro.zip")
             fail("expected ModException")
         } catch (e: ModManager.ModException) {
-            assertTrue(e.message!!.contains("067_brolly_0_2p_i.zpak"))
+            assertTrue(e.message!!.contains("Start the game once"))
         }
         assertArrayEquals(originalAfs, afs.readBytes())
-        assertTrue(File(mods, "pack-report.txt").readText().contains("3 entries, 3 named"))
     }
 
     // ------------------------------------------------------------------
 
     private fun bytes(n: Int, seed: Int) = ByteArray(n) { ((it * 31 + seed * 7) and 0xFF).toByte() }
 
-    private fun entryBytes(archive: AfsArchive, name: String): ByteArray {
-        val e = archive.find(name)!!
+    private fun entryBytes(archive: AfsArchive, name: String): ByteArray = entryBytes(archive, archive.find(name)!!.index)
+
+    private fun entryBytes(archive: AfsArchive, index: Int): ByteArray {
+        val e = archive.entries[index]
         RandomAccessFile(afs, "r").use { raf ->
             val out = ByteArray(e.size.toInt())
             raf.seek(e.offset)

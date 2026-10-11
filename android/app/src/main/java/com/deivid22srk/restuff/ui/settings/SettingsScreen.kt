@@ -887,8 +887,12 @@ private fun ModsSection() {
                 message = "Installed “${mod.name}”: $files file" + (if (files == 1) "" else "s") +
                     " replaced, originals kept as .bk." +
                     (if (save) " Your save was replaced too; the old one is kept as DB_SAVE.bk." else "") +
-                    (if (mod.skipped.isEmpty()) "" else " Skipped ${mod.skipped.size}: " +
-                        mod.skipped.take(3).joinToString("; ") { "${it.path.substringAfterLast('/')} (${it.reason})" })
+                    mod.notes.joinToString("") { " $it" } +
+                    mod.skipped.filter { it.reason != "not a game file" && it.reason != "another copy of the save" }
+                        .let { worth ->
+                            if (worth.isEmpty()) "" else " Skipped ${worth.size}: " +
+                                worth.take(3).joinToString("; ") { "${it.path.substringAfterLast('/')} (${it.reason})" }
+                        }
                 isError = false
             } catch (e: Exception) {
                 message = e.message ?: "Couldn't install the mod."

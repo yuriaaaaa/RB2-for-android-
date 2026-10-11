@@ -16,3 +16,8 @@ Recompiled using the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)
 - [ReXGlue](https://github.com/rexglue/rexglue-sdk) for the recompilation tools.
 - [dlmalloc](https://gee.cs.oswego.edu/dl/html/malloc.html) for the heap allocator.
 - [REBlue](https://github.com/rexglue/reblue) for the dlmalloc setup.
+## Android
+
+An experimental Android (arm64) port lives in [android/](android/README.md). It builds against a
+newer ReXGlue SDK with Android support and needs your own legally obtained copy of the game; no
+game files or prebuilt APKs are included.

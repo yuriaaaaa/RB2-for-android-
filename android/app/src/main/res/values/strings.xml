@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Rótulo do launcher (android:label no AndroidManifest). -->
+    <string name="app_name">Raging Blast 2</string>
+</resources>

@@ -1,0 +1,103 @@
+name: Android build check (Dragon Ball Raging Blast 2)
+
+# The Android port lives in android/. The game is never in this repository, so this workflow
+# runs only what doesn't need it (android/build.sh --skip-game plus the Vortek host tests). To
+# build the game itself, run android/build.sh with your own default.xex; see android/README.md.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Submodules
+        run: |
+          git submodule sync
+          git submodule update --init --depth 1 --recursive rexglue-sdk native/thirdparty/libadrenotools
+          git -C rexglue-sdk log -1 --oneline
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android/sdk/ndk/2[0-6]* || true
+          df -h /
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install host tools (cmake, ninja)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build git
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android packages (platform, build-tools, NDK)
+        run: |
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" > /dev/null
+          yes | sdkmanager --licenses > /dev/null || true
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      # Vortek protocol round trip: serializes in the client and unserializes in the server, so a
+      # change to only one side of a serializer pair fails here.
+      - name: Vortek protocol round-trip test (host)
+        run: |
+          set -e
+          V=native/thirdparty/vortek
+          R=native/thirdparty/vortekrenderer
+          mkdir -p build/rt
+          gcc -c -O1 -Wall -DVK_USE_PLATFORM_ANDROID_KHR -I"$V/include" \
+            "$V/tests/roundtrip_client.c" -o build/rt/client.o
+          gcc -c -O1 -Wall -DVK_USE_PLATFORM_ANDROID_KHR -DVT_SERVER=1 -D_GNU_SOURCE \
+            -I"$R/include" -I"$R/winlator/include" -I"$V/tests/hoststub" \
+            "$V/tests/roundtrip_server.c" -o build/rt/server.o
+          gcc -c -O1 -Wall -I"$V/tests" "$V/tests/roundtrip_main.c" -o build/rt/main.o
+          gcc -c -O1 -DVK_USE_PLATFORM_ANDROID_KHR -I"$V/include" "$V/src/vk_object.c" -o build/rt/vk_object.o
+          gcc -c -O1 -I"$V/include" "$V/src/arrays.c" -o build/rt/arrays.o
+          gcc -O1 build/rt/client.o build/rt/server.o build/rt/main.o \
+            build/rt/vk_object.o build/rt/arrays.o -lpthread -o build/rt/roundtrip
+          ./build/rt/roundtrip
+
+      # Vertex-format mapping in the shader inspector (PACK32 10-10-10-2 USCALED to UINT).
+      - name: Vortek vertex-format conversion test (host)
+        run: |
+          set -e
+          V=native/thirdparty/vortek
+          R=native/thirdparty/vortekrenderer
+          gcc -c -O1 -w -DVK_USE_PLATFORM_ANDROID_KHR -DVT_SERVER=1 -D_GNU_SOURCE \
+            -I"$R/include" -I"$R/winlator/include" -I"$V/tests/hoststub" \
+            "$R/src/shader_inspector.c" -o build/rt/shader_inspector.o
+          gcc -c -O1 -w -DVK_USE_PLATFORM_ANDROID_KHR -DVT_SERVER=1 -D_GNU_SOURCE \
+            -I"$R/include" -I"$R/winlator/include" -I"$V/tests/hoststub" \
+            "$V/tests/unit_formats.c" -o build/rt/unit_formats.o
+          gcc -O1 build/rt/shader_inspector.o build/rt/unit_formats.o \
+            build/rt/arrays.o -lpthread -o build/rt/unit_formats
+          ./build/rt/unit_formats
+
+      # Launcher unit tests, AdrenoTools, Vortek, the SDK libraries with the port's overlays and a
+      # launcher-only APK (no game library).
+      - name: Build without the game
+        run: |
+          chmod +x gradlew build.sh
+          ./build.sh --skip-game
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: android/build/android/arm64-v8a-sdkonly/CMakeCache.txt
+          if-no-files-found: ignore

@@ -1,0 +1,17 @@
+# Dragon Ball Raging Blast 2 (4E4D0826) for the ReXGlue codegen, Android port.
+#
+# Upstream (WistfulHopes/RB2) was generated with the February 2026 SDK. This port builds against
+# the SDK pin shared with the WET and Rumble Roses XX Android ports (bd833a2), so upstream's
+# rb2_config.toml is split into the function list (rb2_functions.toml, generated from it by
+# tools/import_upstream_functions.py) and the native CRT hooks ([rexcrt] in rb2_rexcrt.toml),
+# which replace upstream's hand-written bdengine heap and file hooks.
+
+[project]
+name = "rb2"
+sdk_version = "0.10.0"
+game_root = "assets"
+
+[entrypoint]
+file_path = "assets/default.xex"
+out_directory_path = "generated/default"
+includes = ["rb2_functions.toml", "rb2_functions_extra.toml", "rb2_rexcrt.toml"]

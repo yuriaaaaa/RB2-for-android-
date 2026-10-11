@@ -1,0 +1,6 @@
+# Function boundaries missing from upstream's list (filled in from codegen warnings).
+[functions]
+# A state-machine function (ctr countdown dispatch over five states) in the gap between
+# upstream's 0x822286C0 and 0x82228C78. Without it the codegen folded it into its
+# neighbour and left 12 "Unresolved conditional branch" sites.
+0x822289C8 = { size = 0x2B0 }

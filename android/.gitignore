@@ -1,0 +1,25 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+app/build
+.kotlin
+
+# Native build outputs
+build/
+app/src/main/jniLibs/
+
+# Your game file, the code recompiled from it and signing keys never belong in the repository.
+/rb2/assets/
+/rb2/generated/
+/keystore/
+*.keystore
+*.jks
+thirdparty-src/
+__pycache__/

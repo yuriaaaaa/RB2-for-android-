@@ -1,0 +1,35 @@
+# Native CRT replacements (the SDK's rexcrt), at the addresses upstream hooked by hand.
+#
+# Upstream replaced these in src/bdengine (heap.cpp: dlmalloc in place of the game's NT heap;
+# file_hooks.cpp: std::fstream file I/O).
+# The SDK has since absorbed both as rexcrt; its file functions go through the VFS, which is
+# what lets the Android launcher play straight from an ISO.
+#
+# Upstream's src/hooks.cpp memory and string hooks (memset at 0x8244E7D0, memcpy, strncmp,
+# sprintf_s, atoi and so on) are not carried over. None of those addresses starts a function in
+# upstream's own function list: they sit inside larger CRT blocks (0x8244C9B0, 0x8244D198,
+# 0x8244DFD8, 0x8244FA08), so the old SDK never bound them and the hooks had no effect there
+# either. The game runs its own recompiled CRT code for them.
+
+[rexcrt]
+# Heap (all four or none; the codegen checks the group)
+RtlAllocateHeap   = 0x823F4D60
+RtlFreeHeap       = 0x823F5658
+RtlSizeHeap       = 0x823F3FD8
+RtlReAllocateHeap = 0x823F5950
+
+# File I/O
+CreateFileA      = 0x823F0100
+ReadFile         = 0x823F0428
+WriteFile        = 0x823F02F8
+CloseHandle      = 0x823EFB30
+SetFilePointer   = 0x82491728
+SetEndOfFile     = 0x82492C50
+GetFileSize      = 0x82492FB0
+GetFileSizeEx    = 0x8249A368
+FlushFileBuffers = 0x82492DA8
+DeleteFileA      = 0x82499D60
+FindFirstFileA   = 0x82492EB8
+FindNextFileA    = 0x824930D0
+MoveFileA        = 0x82492DE8
+

@@ -1,0 +1,6 @@
+[submodule "android/rexglue-sdk"]
+	path = android/rexglue-sdk
+	url = https://github.com/rexglue/rexglue-sdk.git
+[submodule "android/native/thirdparty/libadrenotools"]
+	path = android/native/thirdparty/libadrenotools
+	url = https://github.com/bylaws/libadrenotools.git

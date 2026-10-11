@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <string>
 #include <thread>
 
 #include <rex/cvar.h>
@@ -57,4 +58,51 @@ REX_HOOK_RAW(sub_823ECE58) {
     }
   }
   __imp__sub_823ECE58(ctx, base);
+}
+
+// 0.2.6 diagnostic for converted (PS3 -> 360) character mods. Picking one froze the game: a
+// .spr object's table allocation came back null and the memset after it wrote to address 0.
+// Log what each .spr object is built from, and every failed allocation from the game heaps,
+// so the next log says which file and how much memory was asked for.
+REX_EXTERN(__imp__sub_823BEDA0);
+REX_EXTERN(__imp__sub_823B8A68);
+
+namespace {
+std::string GuestString(uint8_t* base, uint32_t addr, size_t max = 48) {
+  std::string s;
+  if (!addr) return s;
+  for (size_t i = 0; i < max; ++i) {
+    const char c = static_cast<char>(base[addr + i]);
+    if (!c) break;
+    s.push_back(c >= 32 && c < 127 ? c : '?');
+  }
+  return s;
+}
+}  // namespace
+
+// SPR object constructor: r3 = object, r4 = .spr data, r5 = its pack entry name.
+REX_HOOK_RAW(sub_823BEDA0) {
+  static std::atomic<int> reports{0};
+  const uint32_t spr = ctx.r4.u32;
+  if (spr && reports.fetch_add(1) < 400) {
+    auto u32 = [&](uint32_t a) { return rex::memory::load_and_swap<uint32_t>(base + a); };
+    const uint32_t types = u32(spr + 8);
+    uint64_t entries = 0;
+    for (uint32_t t = 0; t < types && t < 64; ++t) entries += u32(spr + 64 + t * 12 + 8);
+    REXLOG_INFO("RB2SPR '{}' at {:08X}: magic {:08X} types {} entries {} io {:X} vram {:X} lr {:08X}",
+                GuestString(base, ctx.r5.u32), spr, u32(spr), types, entries, u32(spr + 0x28),
+                u32(spr + 0x30), static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_823BEDA0(ctx, base);
+}
+
+// Game heap allocation (size in r3); returns null when the heap has no room.
+REX_HOOK_RAW(sub_823B8A68) {
+  static std::atomic<int> reports{0};
+  const uint32_t size = ctx.r3.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  __imp__sub_823B8A68(ctx, base);
+  if (ctx.r3.u32 == 0 && reports.fetch_add(1) < 64) {
+    REXLOG_ERROR("RB2HEAP allocation of {} bytes ({:X}) failed, lr {:08X}", size, size, lr);
+  }
 }

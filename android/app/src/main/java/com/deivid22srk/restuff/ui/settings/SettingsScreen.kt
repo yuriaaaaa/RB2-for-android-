@@ -858,6 +858,11 @@ private fun ModsSection() {
     LaunchedEffect(Unit) {
         val m = withContext(Dispatchers.IO) { Mods.manager(context) }
         manager = m
+        val restored = withContext(Dispatchers.IO) { runCatching { m?.repair() }.getOrNull() ?: emptyList() }
+        if (restored.isNotEmpty()) {
+            message = "Put back from .bk: " + restored.joinToString(", ") { it.substringAfterLast('/') }
+            isError = false
+        }
         installed = withContext(Dispatchers.IO) { runCatching { m?.list() }.getOrNull() ?: emptyList() }
     }
 

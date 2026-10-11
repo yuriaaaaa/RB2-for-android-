@@ -68,6 +68,9 @@ class ModManager(
      */
     fun install(zip: InputStream, displayName: String, progress: (String) -> Unit = {}): InstalledMod {
         modsDir.mkdirs()
+        repair()
+        // Installing the same zip again replaces the earlier install of it.
+        readRecords().filter { it.name == displayName }.forEach { uninstall(it.id, progress) }
         val records = readRecords()
         val id = uniqueId(displayName, records)
         val staging = File(modsDir, ".staging-$id")
@@ -204,17 +207,41 @@ class ModManager(
         val backup = File(file.path + BACKUP_SUFFIX)
         val still = installed.flatMap { mod -> mod.changes.filter { it.target == target }.map { mod to it } }
         if (!backup.exists()) {
-            // The mod added this file; there is no original to go back to.
-            if (still.isEmpty()) file.delete()
+            // The mod added this file; there is no original to go back to. An
+            // archive is always the game's own, so it is never deleted.
+            if (still.isEmpty() && kind != Kind.AFS) file.delete()
             return
         }
         if (still.isEmpty()) {
-            if (file.exists() && !file.delete()) throw ModException("Couldn't remove the modded $target.")
-            if (!backup.renameTo(file)) throw ModException("Couldn't restore $target from its backup.")
+            restoreBackup(file, backup)
             return
         }
         copyAtomically(backup, file)
         for ((mod, change) in still) apply(change, File(modsDir, mod.id))
+    }
+
+    /** Puts [backup] back as [file]: a rename, or a copy where the storage won't rename. */
+    private fun restoreBackup(file: File, backup: File) {
+        if (file.exists() && !file.delete()) throw ModException("Couldn't remove the modded ${file.name}.")
+        if (backup.renameTo(file)) return
+        copyAtomically(backup, file)
+        backup.delete()
+    }
+
+    /**
+     * Gives back any game file that exists only as its `.bk` and that no
+     * installed mod changes, e.g. after a restore was cut short.
+     */
+    fun repair(): List<String> {
+        val touched = readRecords().flatMap { m -> m.changes.filter { it.kind != Kind.SAVE }.map { it.target } }.toSet()
+        val restored = mutableListOf<String>()
+        for (rel in backups()) {
+            val target = rel.removeSuffix(BACKUP_SUFFIX)
+            val file = File(gameRoot, target)
+            if (file.exists() || target in touched) continue
+            runCatching { restoreBackup(file, File(gameRoot, rel)) }.onSuccess { restored += target }
+        }
+        return restored
     }
 
     private fun apply(change: Change, storedDir: File) {

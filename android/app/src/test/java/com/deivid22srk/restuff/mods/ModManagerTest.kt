@@ -298,6 +298,26 @@ class ModManagerTest {
     }
 
     @Test
+    fun aLoneBackupIsPutBackAndReinstallReplaces() {
+        val manager = ModManager(game, mods)
+        manager.install(zip("a/000_goku_0_2p_i.zpak" to bytes(100, 21)), "Same.zip")
+        // Simulate a restore that was cut short: only the .bk is left.
+        val bk = File(afs.path + ".bk")
+        assertTrue(afs.delete())
+        File(mods, "installed.txt").delete()
+        assertEquals(listOf("data/X360/st_pack_battle_character_pt_x360.afs"), manager.repair())
+        assertArrayEquals(originalAfs, afs.readBytes())
+        assertFalse(bk.exists())
+
+        manager.install(zip("a/000_goku_0_2p_i.zpak" to bytes(100, 21)), "Again.zip")
+        manager.install(zip("a/000_goku_0_2p_v.zpak" to bytes(100, 22)), "Again.zip")
+        assertEquals(1, manager.list().size)
+        val archive = AfsArchive.open(afs)
+        assertArrayEquals(bytes(3000, 1), entryBytes(archive, "000_goku_0_2p_i.zpak"))
+        assertArrayEquals(bytes(100, 22), entryBytes(archive, "000_goku_0_2p_v.zpak"))
+    }
+
+    @Test
     fun characterModsWaitForTheGameToStartOnce() {
         val manager = ModManager(game, mods, null, File(root, PackIndex.FILE_NAME))
         try {

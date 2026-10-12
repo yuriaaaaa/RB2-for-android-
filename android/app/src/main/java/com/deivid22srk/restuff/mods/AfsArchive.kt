@@ -15,9 +15,8 @@ import java.nio.ByteOrder
  * archives keep the name-table pointer in the 8 bytes just before the first
  * entry instead of right after the TOC, so both places are checked.
  *
- * Replacing an entry never moves another one: new data that fits the entry's
- * slot is written in place, anything bigger is appended at the end of the file,
- * and the TOC (plus the name record's size) is updated to point at it.
+ * The game finds an entry by adding up the sizes before it, so entries are
+ * never appended: see [replaceAll].
  */
 class AfsArchive private constructor(
     private val file: File,
@@ -47,51 +46,118 @@ class AfsArchive private constructor(
         }
     }.getOrDefault("unreadable")
 
-    /** Writes [data] as entry [index]; returns where it ended up. */
-    fun replace(index: Int, data: File): Entry {
-        val entry = entries[index]
-        val length = data.length()
+    /** Writes [data] as entry [index]. */
+    fun replace(index: Int, data: File) = replaceAll(mapOf(index to data))
+
+    /**
+     * Writes each file in [changes] (entry index → new data) into the archive.
+     *
+     * The game doesn't read an entry's offset from the table of contents: it
+     * adds up the earlier entries' sizes, each rounded up to [alignment]. So
+     * every entry has to stay exactly where that sum puts it. Data that is
+     * smaller than the original is zero-padded to the original size (the game
+     * reads the STPZ/STPK headers, not the padding); data that needs more room
+     * moves everything after it further down the file, in one pass from the
+     * end, and the offsets in the table follow. Nothing is ever appended.
+     */
+    fun replaceAll(changes: Map<Int, File>) {
+        if (changes.isEmpty()) return
+        val align = alignment.toLong()
+        val n = entries.size
+        val newSize = LongArray(n) { entries[it].size }
+        for ((index, data) in changes) {
+            require(index in 0 until n) { "entry $index is not in ${file.name}" }
+            val e = entries[index]
+            if (e.offset == 0L && e.size == 0L) throw IOException("${file.name}: entry $index is empty and has no place")
+            newSize[index] = maxOf(data.length(), e.size)
+        }
+        // Physical order; empty entries take no room.
+        val order = entries.filter { it.offset > 0 }.sortedBy { it.offset }
+        val newOffset = LongArray(n) { entries[it].offset }
+        val shiftAt = LongArray(order.size)
+        var delta = 0L
+        for ((k, e) in order.withIndex()) {
+            newOffset[e.index] = e.offset + delta
+            shiftAt[k] = delta
+            delta += alignUp(newSize[e.index], align) - alignUp(e.size, align)
+        }
+        val lastEnd = order.lastOrNull()?.let { it.offset + alignUp(it.size, align) } ?: 0L
+
         RandomAccessFile(file, "rw").use { raf ->
-            val slotEnd = slotEnd(entry, raf.length())
-            // An empty entry (offset 0) has no slot; writing there would hit the header.
-            val offset = if (entry.offset > 0 && entry.offset + length <= slotEnd) {
-                entry.offset
-            } else {
-                alignUp(raf.length(), alignment.toLong())
-            }
-            raf.seek(offset)
-            data.inputStream().use { input ->
-                val buffer = ByteArray(1 shl 16)
-                while (true) {
-                    val n = input.read(buffer)
-                    if (n < 0) break
-                    raf.write(buffer, 0, n)
+            val oldLength = raf.length()
+            if (delta > 0) {
+                raf.setLength(oldLength + delta)
+                // Whatever follows the last entry (a name table) moves by the full amount.
+                if (oldLength > lastEnd) move(raf, lastEnd, lastEnd + delta, oldLength - lastEnd)
+                for (k in order.indices.reversed()) {
+                    val e = order[k]
+                    if (shiftAt[k] == 0L) break
+                    if (e.index !in changes) move(raf, e.offset, e.offset + shiftAt[k], alignUp(e.size, align))
                 }
             }
-            if (offset != entry.offset) {
-                // Keep the archive's alignment so the next append starts on a boundary.
-                val end = offset + length
-                val padded = alignUp(end, alignment.toLong())
-                if (padded > raf.length()) raf.setLength(padded)
+            val buffer = ByteArray(1 shl 16)
+            for ((index, data) in changes) {
+                val at = newOffset[index]
+                raf.seek(at)
+                var written = 0L
+                data.inputStream().use { input ->
+                    while (true) {
+                        val r = input.read(buffer)
+                        if (r < 0) break
+                        raf.write(buffer, 0, r)
+                        written += r
+                    }
+                }
+                // Zero the rest of the slot: padding up to the size the table gives, then alignment.
+                java.util.Arrays.fill(buffer, 0)
+                var left = alignUp(newSize[index], align) - written
+                while (left > 0) {
+                    val w = minOf(left, buffer.size.toLong()).toInt()
+                    raf.write(buffer, 0, w)
+                    left -= w
+                }
             }
-            writeU32(raf, 8L + index * 8L, offset)
-            writeU32(raf, 8L + index * 8L + 4, length)
-            if (nameTableOffset > 0 && nameTableSize >= (index + 1) * NAME_RECORD.toLong()) {
-                writeU32(raf, nameTableOffset + index * NAME_RECORD + 44, length)
+            for (i in 0 until n) {
+                if (newOffset[i] != entries[i].offset) writeU32(raf, 8L + i * 8L, newOffset[i])
+                if (newSize[i] != entries[i].size) writeU32(raf, 8L + i * 8L + 4, newSize[i])
             }
-            return entry.copy(offset = offset, size = length)
+            if (delta > 0) {
+                movePointer(raf, 8L + n * 8L, lastEnd, oldLength, delta)
+                val firstData = order.firstOrNull()?.offset ?: 0L
+                if (firstData - 8 >= 8L + n * 8L + 8) movePointer(raf, firstData - 8, lastEnd, oldLength, delta)
+            }
+            val newNameTable = if (nameTableOffset >= lastEnd) nameTableOffset + delta else nameTableOffset
+            if (nameTableOffset > 0) {
+                for (i in changes.keys) {
+                    if (nameTableSize >= (i + 1) * NAME_RECORD.toLong()) {
+                        writeU32(raf, newNameTable + i * NAME_RECORD + 44, newSize[i])
+                    }
+                }
+            }
         }
     }
 
-    /** End of the space [entry] may use: the next thing in the file after it. */
-    private fun slotEnd(entry: Entry, fileLength: Long): Long {
-        var end = fileLength
-        for (other in entries) {
-            if (other.offset > entry.offset && other.offset < end) end = other.offset
+    /** Copies [length] bytes from [from] to [to] (to > from), back to front so the ranges may overlap. */
+    private fun move(raf: RandomAccessFile, from: Long, to: Long, length: Long) {
+        val buffer = ByteArray(1 shl 20)
+        var left = length
+        while (left > 0) {
+            val n = minOf(left, buffer.size.toLong()).toInt()
+            left -= n
+            raf.seek(from + left)
+            raf.readFully(buffer, 0, n)
+            raf.seek(to + left)
+            raf.write(buffer, 0, n)
         }
-        if (nameTableOffset > entry.offset && nameTableOffset < end) end = nameTableOffset
-        // The last entry before the end of the file may only grow by appending.
-        return if (end == fileLength) alignUp(entry.offset + entry.size, alignment.toLong()).coerceAtMost(fileLength) else end
+    }
+
+    /** The name-table pointer sits after the table of contents; move it with the table. */
+    private fun movePointer(raf: RandomAccessFile, at: Long, lastEnd: Long, oldLength: Long, delta: Long) {
+        val b = ByteArray(4)
+        raf.seek(at)
+        raf.readFully(b)
+        val value = ByteBuffer.wrap(b).order(order).int.toLong() and 0xFFFFFFFFL
+        if (value in lastEnd until oldLength) writeU32(raf, at, value + delta)
     }
 
     private fun writeU32(raf: RandomAccessFile, at: Long, value: Long) {

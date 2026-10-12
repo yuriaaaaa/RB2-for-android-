@@ -67,6 +67,32 @@ class ModManagerTest {
     }
 
     @Test
+    fun keepsEveryEntryWhereTheGameAddsItUp() {
+        val paths = (0 until 6).map { "battle/character/model/chara_067_2p_model_$it.pak" }
+        val names = listOf("big.pak", "small.pak", "same.pak", "x.pak", "y.pak", "z.pak")
+        afs.writeBytes(buildAfs(names.mapIndexed { i, n -> n to bytes(3000 + i * 100, 50 + i) }))
+        val original = afs.readBytes()
+        AfsArchive.open(afs).replaceAll(
+            mapOf(
+                0 to File(root, "a").apply { writeBytes(bytes(9000, 1)) },
+                1 to File(root, "b").apply { writeBytes(bytes(100, 2)) },
+                4 to File(root, "c").apply { writeBytes(bytes(7000, 3)) },
+            )
+        )
+        val archive = AfsArchive.open(afs)
+        assertGameLayout(archive)
+        assertEquals(names, archive.entries.map { it.name })
+        assertEntry(bytes(9000, 1), archive, 0)
+        assertEntry(bytes(100, 2), archive, 1)
+        assertEquals(3100L, archive.entries[1].size)
+        assertEntry(bytes(3200, 52), archive, 2)
+        assertEntry(bytes(3300, 53), archive, 3)
+        assertEntry(bytes(7000, 3), archive, 4)
+        assertEntry(bytes(3500, 55), archive, 5)
+        assertTrue(paths.isNotEmpty() && afs.length() > original.size)
+    }
+
+    @Test
     fun installsAfsEntriesAndFilesWithBackups() {
         val manager = ModManager(game, mods)
         val grown = bytes(5000, 11)   // larger than its 4096-byte slot: appended
@@ -91,9 +117,9 @@ class ModManagerTest {
         assertArrayEquals(newMovie, movie.readBytes())
 
         val archive = AfsArchive.open(afs)
-        assertArrayEquals(grown, entryBytes(archive, "000_goku_0_2p_i.zpak"))
-        assertArrayEquals(shrunk, entryBytes(archive, "000_goku_0_2p_s.zpak"))
-        assertArrayEquals(bytes(1000, 3), entryBytes(archive, "000_goku_0_2p_v.zpak"))
+        assertEntry(grown, archive, "000_goku_0_2p_i.zpak")
+        assertEntry(shrunk, archive, "000_goku_0_2p_s.zpak")
+        assertEntry(bytes(1000, 3), archive, "000_goku_0_2p_v.zpak")
         assertEquals(0L, archive.find("000_goku_0_2p_i.zpak")!!.offset % 2048)
         assertEquals(listOf(mod.id), manager.list().map { it.id })
 
@@ -117,8 +143,8 @@ class ModManagerTest {
 
         manager.uninstall(first.id)
         val archive = AfsArchive.open(afs)
-        assertArrayEquals(bytes(3000, 1), entryBytes(archive, "000_goku_0_2p_i.zpak"))
-        assertArrayEquals(bytes(9000, 22), entryBytes(archive, "000_goku_0_2p_v.zpak"))
+        assertEntry(bytes(3000, 1), archive, "000_goku_0_2p_i.zpak")
+        assertEntry(bytes(9000, 22), archive, "000_goku_0_2p_v.zpak")
         assertTrue(File(afs.path + ".bk").exists())
 
         manager.uninstall(second.id)
@@ -164,8 +190,8 @@ class ModManagerTest {
 
         val manager = ModManager(game, mods)
         manager.install(zip("Modloader/Characters/X/042_chara_0_2p_i.zpak" to bytes(5000, 99)), "BE.zip")
-        assertArrayEquals(bytes(5000, 99), entryBytes(AfsArchive.open(afs), "042_chara_0_2p_i.zpak"))
-        assertArrayEquals(bytes(143, 43), entryBytes(AfsArchive.open(afs), "043_chara_0_2p_i.zpak"))
+        assertEntry(bytes(5000, 99), AfsArchive.open(afs), "042_chara_0_2p_i.zpak")
+        assertEntry(bytes(143, 43), AfsArchive.open(afs), "043_chara_0_2p_i.zpak")
     }
 
     @Test
@@ -257,10 +283,11 @@ class ModManagerTest {
         )
         assertEquals(listOf("#3", "#4", "#5"), mod.changes.map { it.entry })
         val archive = AfsArchive.open(afs)
-        assertArrayEquals(bytes(3000, 1), entryBytes(archive, 3))
-        assertArrayEquals(bytes(300, 2), entryBytes(archive, 4))
-        assertArrayEquals(bytes(5000, 3), entryBytes(archive, 5))
-        assertArrayEquals(bytes(700, 40), entryBytes(archive, 0))
+        assertGameLayout(archive)
+        assertEntry(bytes(3000, 1), archive, 3)
+        assertEntry(bytes(300, 2), archive, 4)
+        assertEntry(bytes(5000, 3), archive, 5)
+        assertEntry(bytes(700, 40), archive, 0)
         assertTrue(File(mods, "install-report.txt").readText().contains("original: 703 bytes"))
 
         manager.uninstall(mod.id)
@@ -313,8 +340,8 @@ class ModManagerTest {
         manager.install(zip("a/000_goku_0_2p_v.zpak" to bytes(100, 22)), "Again.zip")
         assertEquals(1, manager.list().size)
         val archive = AfsArchive.open(afs)
-        assertArrayEquals(bytes(3000, 1), entryBytes(archive, "000_goku_0_2p_i.zpak"))
-        assertArrayEquals(bytes(100, 22), entryBytes(archive, "000_goku_0_2p_v.zpak"))
+        assertEntry(bytes(3000, 1), archive, "000_goku_0_2p_i.zpak")
+        assertEntry(bytes(100, 22), archive, "000_goku_0_2p_v.zpak")
     }
 
     @Test
@@ -332,6 +359,25 @@ class ModManagerTest {
     // ------------------------------------------------------------------
 
     private fun bytes(n: Int, seed: Int) = ByteArray(n) { ((it * 31 + seed * 7) and 0xFF).toByte() }
+
+    /** An entry holds [expected], then only zero padding (smaller data keeps the original size). */
+    private fun assertEntry(expected: ByteArray, archive: AfsArchive, index: Int) {
+        val actual = entryBytes(archive, index)
+        assertTrue("entry $index is shorter than the data", actual.size >= expected.size)
+        assertArrayEquals(expected, actual.copyOf(expected.size))
+        assertTrue("entry $index has data after the padding", actual.drop(expected.size).all { it == 0.toByte() })
+    }
+
+    private fun assertEntry(expected: ByteArray, archive: AfsArchive, name: String) =
+        assertEntry(expected, archive, archive.find(name)!!.index)
+
+    /** Every entry sits where the game looks for it: right after the one before, rounded up to 2048. */
+    private fun assertGameLayout(archive: AfsArchive) {
+        val used = archive.entries.filter { it.offset > 0 }
+        for ((a, b) in used.zipWithNext()) {
+            assertEquals("entry ${b.index}", a.offset + (a.size + 2047) / 2048 * 2048, b.offset)
+        }
+    }
 
     private fun entryBytes(archive: AfsArchive, name: String): ByteArray = entryBytes(archive, archive.find(name)!!.index)
 

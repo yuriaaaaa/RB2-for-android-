@@ -168,9 +168,17 @@ class ModManager(
             try {
                 for ((target, targetChanges) in changes.groupBy { it.target }) {
                     progress("Installing ${target.substringAfterLast('/')}…")
-                    ensureBackup(targetChanges.first().kind, target, targetChanges.any { it.kind == Kind.AFS })
+                    val kind = targetChanges.first().kind
+                    val hadBackup = File(File(baseFor(kind), target).path + BACKUP_SUFFIX).exists()
+                    ensureBackup(kind, target, kind == Kind.AFS)
                     touched += target
-                    for (change in targetChanges) apply(change, stored)
+                    if (kind == Kind.AFS && hadBackup) {
+                        // Start from the original so the archive's layout is the game's own,
+                        // then lay in every installed mod's entries plus this one's.
+                        rebuild(target, records + mod, kind)
+                    } else {
+                        applyAll(targetChanges.map { it to stored })
+                    }
                 }
                 writeRecords(records + mod)
             } catch (e: Exception) {
@@ -217,7 +225,7 @@ class ModManager(
             return
         }
         copyAtomically(backup, file)
-        for ((mod, change) in still) apply(change, File(modsDir, mod.id))
+        applyAll(still.map { (mod, change) -> change to File(modsDir, mod.id) })
     }
 
     /** Puts [backup] back as [file]: a rename, or a copy where the storage won't rename. */
@@ -244,21 +252,25 @@ class ModManager(
         return restored
     }
 
-    private fun apply(change: Change, storedDir: File) {
-        val source = File(storedDir, change.stored)
-        val target = File(baseFor(change.kind), change.target)
-        when (change.kind) {
-            Kind.FILE, Kind.SAVE -> copyAtomically(source, target)
-            Kind.AFS -> {
-                val archive = AfsArchive.open(target)
+    /** Applies [changes] (each with the folder its file is stored in); an archive's are written in one pass. */
+    private fun applyAll(changes: List<Pair<Change, File>>) {
+        for ((change, storedDir) in changes.filter { it.first.kind != Kind.AFS }) {
+            copyAtomically(File(storedDir, change.stored), File(baseFor(change.kind), change.target))
+        }
+        for ((target, group) in changes.filter { it.first.kind == Kind.AFS }.groupBy { it.first.target }) {
+            val archive = AfsArchive.open(File(baseFor(Kind.AFS), target))
+            val writes = LinkedHashMap<Int, File>()
+            for ((change, storedDir) in group) {
                 val name = change.entry!!
                 val index = if (name.startsWith("#")) {
                     name.drop(1).toIntOrNull()?.takeIf { it in archive.entries.indices }
                 } else {
                     archive.find(name)?.index
                 } ?: throw ModException("$name is no longer in ${change.target}.")
-                archive.replace(index, source)
+                // A later mod wins over an earlier one for the same entry.
+                writes[index] = File(storedDir, change.stored)
             }
+            archive.replaceAll(writes)
         }
     }
 

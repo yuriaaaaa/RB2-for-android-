@@ -127,8 +127,9 @@ class ModManager(
         staging.deleteRecursively()
         try {
             progress("Unpacking $displayName…")
-            val extracted = extract(staging)
-            if (extracted.isEmpty()) throw ModException("The archive is empty.")
+            val unpacked = extract(staging)
+            if (unpacked.isEmpty()) throw ModException("The archive is empty.")
+            val extracted = nameByContents(staging, unpacked)
 
             progress("Matching files to the game…")
             val gameIndex = indexGameFiles()
@@ -244,7 +245,7 @@ class ModManager(
             if (changes.isEmpty()) {
                 val report = writePackReport(packs)
                 val why = skipped.take(6).joinToString("\n") { "• ${it.path}: ${it.reason}" }
-                throw ModException("Nothing in this zip replaces a game file.\n$why\n$report")
+                throw ModException("Nothing in this mod replaces a game file.\n$why\n$report")
             }
 
             checkSpace(changes, staging)
@@ -510,6 +511,52 @@ class ModManager(
         }
     }
 
+    /**
+     * Older mods ship a character as `IORAM.stpk`, `SPR.stpk` and `VRAM.pak`, one folder per
+     * version, and name the character only inside the packs (`001_goku_1_D_1p_PS3.ioram`).
+     * Those files are renamed in [staging] to the usual `<character>_PS3_<part>.zpak`.
+     */
+    private fun nameByContents(staging: File, paths: List<String>): List<String> {
+        class Found(val path: String, val part: Char, val stem: String?, val ps3: Boolean)
+        val found = paths.mapNotNull { path ->
+            val name = path.substringAfterLast('/')
+            if (PackIndex.characterFile(name) != null) return@mapNotNull null
+            val file = File(staging, path)
+            if (file.length() !in 64..MAX_NAMED_PACK) return@mapNotNull null
+            val head = ByteArray(4).also { b -> file.inputStream().use { it.read(b) } }.toString(Charsets.ISO_8859_1)
+            if (head != "STPK" && head != "STPZ") return@mapNotNull null
+            val inner = runCatching { Ps3Converter.entryNames(file.readBytes()) }.getOrNull() ?: return@mapNotNull null
+            val first = inner.firstOrNull() ?: return@mapNotNull null
+            val character = PackIndex.characterFile(first)
+            val base = name.substringBeforeLast('.').lowercase()
+            val part = when {
+                first.endsWith(".ioram", true) || inner.all { it.endsWith(".ioram", true) } -> 'i'
+                inner.any { it.endsWith(".spr", true) } -> 'm'
+                first.endsWith(".vram", true) -> 'v'
+                base.contains("ioram") -> 'i'
+                base.contains("vram") -> 'v'
+                base.contains("spr") || base.contains("model") -> 'm'
+                else -> return@mapNotNull null
+            }
+            Found(path, part, character?.stem, first.contains("_PS3", ignoreCase = true))
+        }
+        if (found.isEmpty()) return paths
+        val renamed = HashMap<String, String>()
+        for ((folder, files) in found.groupBy { it.path.substringBeforeLast('/', "") }) {
+            // A pack whose own name is off (`0001_goku_...`) takes the character its folder names.
+            val stems = files.mapNotNull { it.stem }.distinct()
+            for (f in files) {
+                val stem = f.stem ?: stems.singleOrNull() ?: continue
+                val letter = if (f.part == 'm') 's' else f.part
+                val target = (if (folder.isEmpty()) "" else "$folder/") +
+                    stem + (if (f.ps3 || files.any { it.ps3 }) "_PS3" else "") + "_$letter.zpak"
+                if (target in paths || target in renamed.values) continue
+                if (File(staging, f.path).renameTo(File(staging, target))) renamed[f.path] = target
+            }
+        }
+        return paths.map { renamed[it] ?: it }
+    }
+
     /** True when a pack's own file names say it is PS3 data (`000_goku_0_2p_PS3.spr`). */
     private fun looksPs3(file: File): Boolean = file.name.contains("_PS3", ignoreCase = true) || runCatching {
         val head = ByteArray(minOf(512L, file.length()).toInt())
@@ -722,6 +769,8 @@ class ModManager(
     companion object {
         const val BACKUP_SUFFIX = ".bk"
         private const val UNMATCHED = "doesn't match any game file"
+        /** Largest pack opened to read the character name inside it. */
+        private const val MAX_NAMED_PACK = 64L shl 20
         private const val NO_INDEX = "the game hasn't been started yet, so its character file list isn't known"
         private const val MB = 1024L * 1024L
         private const val SPACE_MARGIN = 64L * MB

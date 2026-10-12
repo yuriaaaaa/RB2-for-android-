@@ -180,7 +180,7 @@ class ModManagerTest {
             manager.install(zip("Goku/SPR.stpk" to bytes(10, 1)), "PS3 mod.zip")
             fail("expected ModException")
         } catch (e: ModManager.ModException) {
-            assertTrue(e.message!!.contains("Nothing in this zip"))
+            assertTrue(e.message!!.contains("Nothing in this mod"))
         }
         assertArrayEquals(originalAfs, afs.readBytes())
         assertFalse(File(afs.path + ".bk").exists())
@@ -400,6 +400,33 @@ class ModManagerTest {
     }
 
     @Test
+    fun genericallyNamedPacksAreMatchedByTheNamesInside() {
+        val paths = listOf("i", "m", "v").map { "battle/character/model/chara_001_D_1p_model_$it.pak" }
+        afs.writeBytes(buildAfs(paths.mapIndexed { i, _ -> "" to bytes(5000 + i, 40 + i) }))
+        val index = File(root, PackIndex.FILE_NAME)
+        PackIndex.write(index, mapOf("st_pack_battle_character_pt_x360.afs" to paths))
+        // LBFury's layout: IORAM.stpk / SPR.stpk / VRAM.pak per version, the vram pack misnamed.
+        fun version(folder: String, seed: Int) = listOf(
+            "$folder/IORAM.stpk" to onePak("001_goku_1_D_1p_PS3.ioram", bytes(300, seed)),
+            "$folder/SPR.stpk" to ps3Model("001_goku_1_D_1p_PS3.spr"),
+            "$folder/VRAM.pak" to Stpz.compress(onePak("0001_goku_1_D_1p_PS3.vram", ByteArray(24) { it.toByte() })),
+        )
+        val archive = File(root, "Goku Blue Damaged.zip")
+        archive.outputStream().use { o ->
+            zip(*(version("Goku Blue Damaged (DBS Broly)", 1) + version("Goku Blue Damaged (DBS Manga)", 2) +
+                listOf("READ OR DIE.txt" to "links".toByteArray())).toTypedArray()).copyTo(o)
+        }
+        var asked: Pair<String, List<String>>? = null
+        val mod = ModManager(game, mods, File(root, "saves"), index)
+            .install(archive, "Goku Blue Damaged.zip", { name, versions -> asked = name to versions; 1 })
+        assertEquals("001_goku_1_d_1p" to listOf("Goku Blue Damaged (DBS Broly)", "Goku Blue Damaged (DBS Manga)"), asked)
+        assertEquals(3, mod.changes.size)
+        assertTrue(mod.changes.all { it.stored.startsWith("Goku Blue Damaged (DBS Manga)/") })
+        val ioram = Stpz.decompress(entryBytes(AfsArchive.open(afs), 0))
+        assertArrayEquals(bytes(300, 2), ioram.copyOfRange(0x1000, 0x1000 + 300))
+    }
+
+    @Test
     fun rarAndSevenZipNeedTheUnpacker() {
         val archive = File(root, "mod.rar").apply { writeBytes("Rar!\u001a\u0007\u0000".toByteArray() + bytes(100, 1)) }
         val e = runCatching { ModManager(game, mods).install(archive, "mod.rar") }.exceptionOrNull()
@@ -421,7 +448,7 @@ class ModManagerTest {
     }
 
     /** A PS3 model pack: one .spr with a 4x4 DXT1 texture and a 4x1 shading ramp. */
-    private fun ps3Model(): ByteArray {
+    private fun ps3Model(name: String = "067_brolly_0_2p_PS3.spr"): ByteArray {
         val strings = "\u0000067_brolly_0_2p_PS3.ioram\u0000067_brolly_0_2p_PS3.vram\u0000".toByteArray().let { it.copyOf((it.size + 15) / 16 * 16) }
         val spr = ByteBuffer.allocate(64 + 12 + strings.size + 64 + 96)
         spr.put("SPRP".toByteArray()).putInt(0x10001).putInt(1).putInt(0).putInt(0).putInt(12)
@@ -437,7 +464,7 @@ class ModManagerTest {
         val body = spr.array()
         val b = ByteBuffer.allocate(0x50 + body.size)
         b.put("STPK".toByteArray()).putInt(1).putInt(1).putInt(16).putInt(0x50).putInt(body.size).putInt(0).putInt(0)
-        b.put("067_brolly_0_2p_PS3.spr".toByteArray()); b.position(0x50); b.put(body)
+        b.put(name.toByteArray()); b.position(0x50); b.put(body)
         return b.array()
     }
 

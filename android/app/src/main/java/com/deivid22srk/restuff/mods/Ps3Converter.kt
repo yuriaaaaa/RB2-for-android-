@@ -181,6 +181,9 @@ object Ps3Converter {
         return out
     }
 
+    /** Names of the files in a pack (STPZ or STPK), in order. */
+    fun entryNames(d: ByteArray): List<String> = entries(if (Stpz.isStpz(d)) Stpz.decompress(d) else d).map { it.first }
+
     /** (name, offset, size) of each file in an STPK. */
     private fun entries(d: ByteArray): List<Triple<String, Int, Int>> {
         if (d.size < 16 || String(d, 0, 4, Charsets.ISO_8859_1) != "STPK") throw ConvertException("not an STPK pack")

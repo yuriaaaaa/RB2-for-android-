@@ -316,7 +316,7 @@ class ModManagerTest {
     }
 
     @Test
-    fun ps3CharacterFilesAreHeldBackAndTheOriginalsExported() {
+    fun aPs3CharacterWithoutAllItsPartsIsHeldBackAndTheOriginalsExported() {
         val paths = listOf(
             "battle/character/model/chara_067_2p_model_i.pak",
             "battle/character/model/chara_067_2p_model_m.pak",
@@ -343,6 +343,64 @@ class ModManagerTest {
         assertArrayEquals(bytes(55000, 6), save.readBytes())
         assertEquals(1, mod.notes.size)
         assertArrayEquals(bytes(700, 40), File(mods, "x360-originals/st_pack_battle_character-0.zpak").readBytes())
+    }
+
+    @Test
+    fun ps3CharactersAreConvertedOnInstall() {
+        val paths = listOf("i", "m", "v").map { "battle/character/model/chara_067_2p_model_$it.pak" }
+        afs.writeBytes(buildAfs(paths.mapIndexed { i, _ -> "" to bytes(5000 + i, 40 + i) }))
+        val index = File(root, PackIndex.FILE_NAME)
+        PackIndex.write(index, mapOf("st_pack_battle_character_pt_x360.afs" to paths))
+        val manager = ModManager(game, mods, File(root, "saves"), index)
+        val mod = manager.install(
+            zip(
+                "Moro/067_brolly_0_2p_i.zpak" to Stpz.compress(onePak("067_brolly_0_2p_PS3.ioram", bytes(300, 1))),
+                "Moro/067_brolly_0_2p_s.zpak" to Stpz.compress(ps3Model()),
+                "Moro/067_brolly_0_2p_v.zpak" to Stpz.compress(onePak("067_brolly_0_2p_PS3.vram", ByteArray(8 + 16) { it.toByte() })),
+            ),
+            "Moro.zip"
+        )
+        assertEquals(3, mod.changes.size)
+        assertTrue(mod.notes.single().startsWith("1 PS3/PC character was converted"))
+        val archive = AfsArchive.open(afs)
+        assertGameLayout(archive)
+        val model = Stpz.decompress(entryBytes(archive, 1))
+        assertEquals("067_brolly_0_2pX360.spr", String(model, 32, 23, Charsets.ISO_8859_1))
+        assertEquals("SPR3", String(model, 0x50, 4, Charsets.ISO_8859_1))
+        val vram = Stpz.decompress(entryBytes(archive, 2))
+        assertEquals("067_brolly_0_2pX360.vram", String(vram, 32, 24, Charsets.ISO_8859_1))
+        // A 4x4 DXT1 texture (one block, words swapped, tiled into 32x32 blocks) and a ramp (32 KB).
+        assertEquals(0x1000 + 8192 + 32768, vram.size)
+        assertArrayEquals(byteArrayOf(1, 0, 3, 2, 5, 4, 7, 6), vram.copyOfRange(0x1000, 0x1008))
+    }
+
+    /** STPK holding one file at 0x80, like the PS3 packs. */
+    private fun onePak(name: String, data: ByteArray): ByteArray {
+        val b = ByteBuffer.allocate(0x80 + data.size)
+        b.put("STPK".toByteArray()).putInt(1).putInt(1).putInt(16).putInt(0x80).putInt(data.size).putInt(0).putInt(0)
+        b.put(name.toByteArray()); b.position(0x80); b.put(data)
+        return b.array()
+    }
+
+    /** A PS3 model pack: one .spr with a 4x4 DXT1 texture and a 4x1 shading ramp. */
+    private fun ps3Model(): ByteArray {
+        val strings = "\u0000067_brolly_0_2p_PS3.ioram\u0000067_brolly_0_2p_PS3.vram\u0000".toByteArray().let { it.copyOf((it.size + 15) / 16 * 16) }
+        val spr = ByteBuffer.allocate(64 + 12 + strings.size + 64 + 96)
+        spr.put("SPRP".toByteArray()).putInt(0x10001).putInt(1).putInt(0).putInt(0).putInt(12)
+            .putInt(strings.size).putInt(64).putInt(96).putInt(1).putInt(0).putInt(28).putInt(0)
+        spr.position(64); spr.put("TX2D".toByteArray()).putInt(0).putInt(2)
+        spr.put(strings)
+        for (k in 0 until 2) spr.putInt(0).putInt(0).putInt(0).putInt(k * 48).putInt(36).putInt(0).putInt(0).putInt(0)
+        val data = spr.position()
+        spr.putInt(0).putInt(0).putInt(0).putInt(8).putShort(4).putShort(4).putShort(0).putShort(1)
+        spr.position(data + 0x20); spr.put(8)
+        spr.position(data + 48)
+        spr.putInt(2).putInt(8).putInt(0).putInt(16).putShort(4).putShort(1).putShort(0).putShort(1)
+        val body = spr.array()
+        val b = ByteBuffer.allocate(0x50 + body.size)
+        b.put("STPK".toByteArray()).putInt(1).putInt(1).putInt(16).putInt(0x50).putInt(body.size).putInt(0).putInt(0)
+        b.put("067_brolly_0_2p_PS3.spr".toByteArray()); b.position(0x50); b.put(body)
+        return b.array()
     }
 
     @Test

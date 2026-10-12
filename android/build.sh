@@ -40,9 +40,9 @@ bash "$HERE/scripts/apply_overlays.sh"
 echo "==> Launcher unit tests"
 (cd "$HERE" && ./gradlew --no-daemon :app:testDebugUnitTest)
 
-# Last build made for the device: 0.2.9 (code 13).
-export RESTUFF_VERSION_CODE="${RESTUFF_VERSION_CODE:-13}"
-export RESTUFF_VERSION_NAME="${RESTUFF_VERSION_NAME:-0.2.9}"
+# Last build made for the device: 0.3.0 (code 14).
+export RESTUFF_VERSION_CODE="${RESTUFF_VERSION_CODE:-14}"
+export RESTUFF_VERSION_NAME="${RESTUFF_VERSION_NAME:-0.3.0}"
 mkdir -p "$HERE/build/out"
 if [ "$SKIP_GAME" = 1 ]; then
     echo "==> Native libraries without the game (AdrenoTools, Vortek, SDK with the port's overlays)"

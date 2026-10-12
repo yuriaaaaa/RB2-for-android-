@@ -41,6 +41,12 @@ class ModManager(
 
     data class Skipped(val path: String, val reason: String)
 
+    /** One file (`_i`, `_s` or `_v`) of a PS3/PC character, and the pack slot it replaces. */
+    private data class Ps3Part(val path: String, val slot: Pair<String, Int>) {
+        val part = path.substringBeforeLast('.').lowercase().last()
+        val stem = path.substringBeforeLast('.').dropLast(2).lowercase()
+    }
+
     data class InstalledMod(
         val id: String,
         val name: String,
@@ -88,6 +94,7 @@ class ModManager(
             val saves = findSaves()
             val changes = mutableListOf<Change>()
             val skipped = mutableListOf<Skipped>()
+            val ps3Parts = mutableListOf<Ps3Part>()
             val ps3Slots = mutableListOf<Pair<String, Int>>()
             var saveTaken = false
             for (path in extracted) {
@@ -113,12 +120,9 @@ class ModManager(
                             hits != null -> hits.forEach { (archive, entryName) ->
                                 changes += Change(Kind.AFS, archive, entryName, path)
                             }
-                            // PS3/PC character packs crash the Xbox 360 game (it can't read
-                            // them), so they're held back until they can be converted.
-                            slot != null && looksPs3(File(staging, path)) -> {
-                                skipped += Skipped(path, PS3_FORMAT)
-                                ps3Slots += slot
-                            }
+                            // PS3/PC character packs are converted below, once all three
+                            // parts of the character are known.
+                            slot != null && looksPs3(File(staging, path)) -> ps3Parts += Ps3Part(path, slot)
                             slot != null -> changes += Change(Kind.AFS, slot.first, "#${slot.second}", path)
                             name.contains("_ps3", ignoreCase = true) ->
                                 skipped += Skipped(path, "PS3 file; this port uses the Xbox 360 data")
@@ -129,11 +133,38 @@ class ModManager(
                     }
                 }
             }
+            var converted = 0
+            for ((stem, parts) in ps3Parts.groupBy { it.stem }) {
+                val i = parts.firstOrNull { it.part == 'i' }
+                val s = parts.firstOrNull { it.part == 's' }
+                val v = parts.firstOrNull { it.part == 'v' }
+                val why = if (i == null || s == null || v == null || parts.size != 3) {
+                    "PS3/PC character without all three of its _i, _s and _v files; it can't be converted"
+                } else {
+                    progress("Converting ${stem.substringAfterLast('/')} to the Xbox 360 format…")
+                    runCatching {
+                        val c = Ps3Converter.convert(
+                            File(staging, i.path).readBytes(), File(staging, s.path).readBytes(),
+                            File(staging, v.path).readBytes(),
+                        )
+                        File(staging, i.path).writeBytes(c.ioram)
+                        File(staging, s.path).writeBytes(c.model)
+                        File(staging, v.path).writeBytes(c.vram)
+                    }.exceptionOrNull()?.let { "PS3/PC character that couldn't be converted: ${it.message}" }
+                }
+                if (why == null) {
+                    parts.forEach { changes += Change(Kind.AFS, it.slot.first, "#${it.slot.second}", it.path) }
+                    converted++
+                } else {
+                    parts.forEach { skipped += Skipped(it.path, why); ps3Slots += it.slot }
+                }
+            }
             exportOriginals(ps3Slots)
             if (changes.isEmpty() && ps3Slots.isNotEmpty()) {
                 throw ModException(
-                    "This mod's character files are PS3/PC versions, and the Xbox 360 game can't load them " +
-                        "(it goes black or crashes), so nothing was installed."
+                    "This mod's character files are PS3/PC versions that couldn't be converted, so nothing " +
+                        "was installed.\n" + skipped.filter { it.reason.startsWith("PS3/PC") }.take(6)
+                        .joinToString("\n") { "• ${it.path}: ${it.reason}" }
                 )
             }
             if (changes.isEmpty() && skipped.any { it.reason == NO_INDEX }) {
@@ -153,9 +184,11 @@ class ModManager(
             if (skipped.any { it.reason == NO_INDEX }) {
                 notes += "Character files were skipped: start the game once, then install this mod again for them."
             }
+            if (converted > 0) {
+                notes += "$converted PS3/PC character${if (converted == 1) " was" else "s were"} converted to the Xbox 360 format."
+            }
             if (ps3Slots.isNotEmpty()) {
-                notes += "Its ${ps3Slots.size} character files were left out: they're PS3/PC versions, " +
-                    "which the Xbox 360 game can't load."
+                notes += "Its ${ps3Slots.size} PS3/PC character files that couldn't be converted were left out."
             }
             writeInstallReport(changes, staging)
 
@@ -601,7 +634,6 @@ class ModManager(
     companion object {
         const val BACKUP_SUFFIX = ".bk"
         private const val UNMATCHED = "doesn't match any game file"
-        private const val PS3_FORMAT = "PS3/PC version; the Xbox 360 game can't load it"
         private const val NO_INDEX = "the game hasn't been started yet, so its character file list isn't known"
         private const val MB = 1024L * 1024L
         private const val SPACE_MARGIN = 64L * MB

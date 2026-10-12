@@ -913,8 +913,8 @@ private fun ModsSection() {
         Text(
             text = "Install a mod from a .zip. Files it replaces in your game folder are kept " +
                 "as .bk backups, and character files (.zpak) are swapped inside the game's " +
-                ".afs packs. Remove a mod to put the originals back. Mods made for the " +
-                "PS3 version don't work here.",
+                ".afs packs. Remove a mod to put the originals back. PS3/PC character " +
+                "files are converted to the Xbox 360 format as they install.",
             color = PortPalette.textSecondary,
             style = PortType.rowSub
         )

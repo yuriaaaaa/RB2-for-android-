@@ -84,12 +84,33 @@ class ModManagerTest {
         assertEquals(names, archive.entries.map { it.name })
         assertEntry(bytes(9000, 1), archive, 0)
         assertEntry(bytes(100, 2), archive, 1)
-        assertEquals(3100L, archive.entries[1].size)
+        assertEquals(100L, archive.entries[1].size)
         assertEntry(bytes(3200, 52), archive, 2)
         assertEntry(bytes(3300, 53), archive, 3)
         assertEntry(bytes(7000, 3), archive, 4)
         assertEntry(bytes(3500, 55), archive, 5)
         assertTrue(paths.isNotEmpty() && afs.length() > original.size)
+    }
+
+    @Test
+    fun shrunkEntriesPullTheRestOfTheArchiveBack() {
+        val names = listOf("a.pak", "b.pak", "c.pak", "d.pak")
+        afs.writeBytes(buildAfs(names.mapIndexed { i, n -> n to bytes(9000 + i * 100, 60 + i) }))
+        val original = afs.length()
+        AfsArchive.open(afs).replaceAll(
+            mapOf(
+                1 to File(root, "b").apply { writeBytes(bytes(500, 4)) },
+                2 to File(root, "c").apply { writeBytes(bytes(2100, 5)) },
+            )
+        )
+        val archive = AfsArchive.open(afs)
+        assertGameLayout(archive)
+        assertEquals(names, archive.entries.map { it.name })
+        assertEntry(bytes(9000, 60), archive, 0)
+        assertEntry(bytes(500, 4), archive, 1)
+        assertEntry(bytes(2100, 5), archive, 2)
+        assertEntry(bytes(9300, 63), archive, 3)
+        assertEquals(original - 8192 - 6144, afs.length())
     }
 
     @Test
@@ -360,12 +381,9 @@ class ModManagerTest {
 
     private fun bytes(n: Int, seed: Int) = ByteArray(n) { ((it * 31 + seed * 7) and 0xFF).toByte() }
 
-    /** An entry holds [expected], then only zero padding (smaller data keeps the original size). */
+    /** An entry holds exactly [expected]: the table gives its real size, never a padded one. */
     private fun assertEntry(expected: ByteArray, archive: AfsArchive, index: Int) {
-        val actual = entryBytes(archive, index)
-        assertTrue("entry $index is shorter than the data", actual.size >= expected.size)
-        assertArrayEquals(expected, actual.copyOf(expected.size))
-        assertTrue("entry $index has data after the padding", actual.drop(expected.size).all { it == 0.toByte() })
+        assertArrayEquals("entry $index", expected, entryBytes(archive, index))
     }
 
     private fun assertEntry(expected: ByteArray, archive: AfsArchive, name: String) =

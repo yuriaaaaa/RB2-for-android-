@@ -16,7 +16,7 @@ import java.nio.ByteOrder
  * entry instead of right after the TOC, so both places are checked.
  *
  * The game finds an entry by adding up the sizes before it, so entries are
- * never appended: see [replaceAll].
+ * never appended and every size in the table is exact: see [replaceAll].
  */
 class AfsArchive private constructor(
     private val file: File,
@@ -54,11 +54,12 @@ class AfsArchive private constructor(
      *
      * The game doesn't read an entry's offset from the table of contents: it
      * adds up the earlier entries' sizes, each rounded up to [alignment]. So
-     * every entry has to stay exactly where that sum puts it. Data that is
-     * smaller than the original is zero-padded to the original size (the game
-     * reads the STPZ/STPK headers, not the padding); data that needs more room
-     * moves everything after it further down the file, in one pass from the
-     * end, and the offsets in the table follow. Nothing is ever appended.
+     * every entry has to stay exactly where that sum puts it. Each new entry
+     * gets its exact size in the table, as the originals do: the game streams
+     * the whole size through its STPZ decompressor, which runs off the end of
+     * its buffers on zero padding. Everything after a changed entry moves by
+     * the difference (towards the end when it grew, towards the start when it
+     * shrank), the offsets in the table follow, and nothing is ever appended.
      */
     fun replaceAll(changes: Map<Int, File>) {
         if (changes.isEmpty()) return
@@ -69,32 +70,30 @@ class AfsArchive private constructor(
             require(index in 0 until n) { "entry $index is not in ${file.name}" }
             val e = entries[index]
             if (e.offset == 0L && e.size == 0L) throw IOException("${file.name}: entry $index is empty and has no place")
-            newSize[index] = maxOf(data.length(), e.size)
+            newSize[index] = data.length()
         }
         // Physical order; empty entries take no room.
         val order = entries.filter { it.offset > 0 }.sortedBy { it.offset }
         val newOffset = LongArray(n) { entries[it].offset }
-        val shiftAt = LongArray(order.size)
+        // Unchanged spans to move: (old start, length, shift). The last one is whatever
+        // follows the last entry (a name table).
+        val spans = ArrayList<Triple<Long, Long, Long>>()
         var delta = 0L
-        for ((k, e) in order.withIndex()) {
+        for (e in order) {
             newOffset[e.index] = e.offset + delta
-            shiftAt[k] = delta
+            if (e.index !in changes && delta != 0L) spans.add(Triple(e.offset, alignUp(e.size, align), delta))
             delta += alignUp(newSize[e.index], align) - alignUp(e.size, align)
         }
         val lastEnd = order.lastOrNull()?.let { it.offset + alignUp(it.size, align) } ?: 0L
 
         RandomAccessFile(file, "rw").use { raf ->
             val oldLength = raf.length()
-            if (delta > 0) {
-                raf.setLength(oldLength + delta)
-                // Whatever follows the last entry (a name table) moves by the full amount.
-                if (oldLength > lastEnd) move(raf, lastEnd, lastEnd + delta, oldLength - lastEnd)
-                for (k in order.indices.reversed()) {
-                    val e = order[k]
-                    if (shiftAt[k] == 0L) break
-                    if (e.index !in changes) move(raf, e.offset, e.offset + shiftAt[k], alignUp(e.size, align))
-                }
-            }
+            if (delta != 0L && oldLength > lastEnd) spans.add(Triple(lastEnd, oldLength - lastEnd, delta))
+            if (delta > 0) raf.setLength(oldLength + delta)
+            // Spans moving towards the start go first, front to back, then the ones moving
+            // towards the end, back to front: neither lands on data that hasn't moved yet.
+            for ((from, length, shift) in spans) if (shift < 0) move(raf, from, from + shift, length)
+            for ((from, length, shift) in spans.reversed()) if (shift > 0) move(raf, from, from + shift, length)
             val buffer = ByteArray(1 shl 16)
             for ((index, data) in changes) {
                 val at = newOffset[index]
@@ -108,7 +107,7 @@ class AfsArchive private constructor(
                         written += r
                     }
                 }
-                // Zero the rest of the slot: padding up to the size the table gives, then alignment.
+                // Zero the alignment padding.
                 java.util.Arrays.fill(buffer, 0)
                 var left = alignUp(newSize[index], align) - written
                 while (left > 0) {
@@ -117,11 +116,12 @@ class AfsArchive private constructor(
                     left -= w
                 }
             }
+            if (delta < 0) raf.setLength(oldLength + delta)
             for (i in 0 until n) {
                 if (newOffset[i] != entries[i].offset) writeU32(raf, 8L + i * 8L, newOffset[i])
                 if (newSize[i] != entries[i].size) writeU32(raf, 8L + i * 8L + 4, newSize[i])
             }
-            if (delta > 0) {
+            if (delta != 0L) {
                 movePointer(raf, 8L + n * 8L, lastEnd, oldLength, delta)
                 val firstData = order.firstOrNull()?.offset ?: 0L
                 if (firstData - 8 >= 8L + n * 8L + 8) movePointer(raf, firstData - 8, lastEnd, oldLength, delta)
@@ -137,17 +137,19 @@ class AfsArchive private constructor(
         }
     }
 
-    /** Copies [length] bytes from [from] to [to] (to > from), back to front so the ranges may overlap. */
+    /** Copies [length] bytes from [from] to [to], in the direction that lets the ranges overlap. */
     private fun move(raf: RandomAccessFile, from: Long, to: Long, length: Long) {
         val buffer = ByteArray(1 shl 20)
-        var left = length
-        while (left > 0) {
-            val n = minOf(left, buffer.size.toLong()).toInt()
-            left -= n
-            raf.seek(from + left)
+        var done = 0L
+        while (done < length) {
+            val n = minOf(length - done, buffer.size.toLong()).toInt()
+            // Moving towards the end copies the last chunk first.
+            val at = if (to > from) length - done - n else done
+            raf.seek(from + at)
             raf.readFully(buffer, 0, n)
-            raf.seek(to + left)
+            raf.seek(to + at)
             raf.write(buffer, 0, n)
+            done += n
         }
     }
 

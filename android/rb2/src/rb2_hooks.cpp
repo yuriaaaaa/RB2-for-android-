@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <string>
 #include <thread>
 
@@ -105,4 +106,57 @@ REX_HOOK_RAW(sub_823B8A68) {
   if (ctx.r3.u32 == 0 && reports.fetch_add(1) < 64) {
     REXLOG_ERROR("RB2HEAP allocation of {} bytes ({:X}) failed, lr {:08X}", size, size, lr);
   }
+}
+
+// 0.2.7: the 0.2.6 log showed the character model's and face's .spr pointers were garbage
+// (unaligned, zero header), so the pack data they point into was not what the game expected.
+// Dump the file objects those two builders read: buffer, sizes, flags and the first bytes.
+REX_EXTERN(__imp__sub_82175FC8);
+REX_EXTERN(__imp__sub_82176890);
+
+namespace {
+void LogPackFile(uint8_t* base, const char* what, uint32_t file) {
+  auto u32 = [&](uint32_t a) { return rex::memory::load_and_swap<uint32_t>(base + a); };
+  if (!file) {
+    REXLOG_INFO("RB2FILE {}: null", what);
+    return;
+  }
+  const uint32_t buf = u32(file + 48), hdr = u32(file + 68);
+  std::string head;
+  if (hdr) {
+    for (int i = 0; i < 64; ++i) {
+      char b[3];
+      std::snprintf(b, sizeof(b), "%02x", base[hdr + i]);
+      head += b;
+    }
+  }
+  REXLOG_INFO("RB2FILE {} obj {:08X} name '{}' buf {:08X} hdr {:08X} size44 {:X} size92 {:X} "
+              "raw {} packed {} mode {} head {}",
+              what, file, GuestString(base, u32(file + 40), 96), buf, hdr, u32(file + 44),
+              u32(file + 92), u32(file + 84), u32(file + 88), u32(file + 60), head);
+}
+}  // namespace
+
+REX_HOOK_RAW(sub_82175FC8) {
+  static std::atomic<int> reports{0};
+  const uint32_t obj = ctx.r3.u32;
+  if (obj && reports.fetch_add(1) < 16) {
+    auto u32 = [&](uint32_t a) { return rex::memory::load_and_swap<uint32_t>(base + a); };
+    LogPackFile(base, "model_m", u32(obj + 4 * (u32(obj + 364) + 5)));
+    LogPackFile(base, "model_v", u32(obj + 4 * (u32(obj + 368) + 5)));
+    LogPackFile(base, "model_i", u32(obj + 4 * (u32(obj + 372) + 5)));
+  }
+  __imp__sub_82175FC8(ctx, base);
+}
+
+REX_HOOK_RAW(sub_82176890) {
+  static std::atomic<int> reports{0};
+  const uint32_t obj = ctx.r3.u32;
+  auto u32 = [&](uint32_t a) { return rex::memory::load_and_swap<uint32_t>(base + a); };
+  // Only when it is about to build the face (the branch that calls the .spr constructor).
+  if (obj && u32(obj + 196) == 0 && u32(obj + 200) == 0 && reports.fetch_add(1) < 16) {
+    LogPackFile(base, "face_m", u32(obj + 28));
+    LogPackFile(base, "face_v", u32(obj + 68));
+  }
+  __imp__sub_82176890(ctx, base);
 }

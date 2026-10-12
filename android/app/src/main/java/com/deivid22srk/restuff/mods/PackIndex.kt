@@ -71,13 +71,39 @@ class PackIndex private constructor(private val packs: Map<String, IntArray>) {
             file.writeBytes(buf.array())
         }
 
-        private val CHARACTER_MODEL = Regex("""^(\d{3})_.*?_(D_)?(\d+)p_([isvm])\.zpak$""", RegexOption.IGNORE_CASE)
+        private val CHARACTER_MODEL = Regex(
+            """^((\d{3})_.*?_(D_)?(\d+)p)(?:_PS3|_X360)?(?:[_-]([isvm])\.z?pak|\.(ioram|spr|vram))$""",
+            RegexOption.IGNORE_CASE,
+        )
+
+        /** " - Copia", " - Copy", " (2)" left behind by a file manager before the extension. */
+        private val COPY_SUFFIX = Regex("""(\s*-\s*(copia|copy|kopie|copie))?(\s*\(\d+\))?(?=\.[^.]+$)""", RegexOption.IGNORE_CASE)
+
+        /** One file of a character's model: which character ([stem]) and which part (i, m or v). */
+        data class CharacterFile(val stem: String, val id: String, val damaged: Boolean, val players: String, val part: Char)
+
+        /**
+         * Reads a character model file name: `067_brolly_0_2p_i.zpak`, the older PS3 namings
+         * `035_vegito_1_1p_PS3-i.zpak` / `088_gohan_8_1p_PS3_i.zpak` (also `_X360`, `.pak`),
+         * and loose `001_goku_1_1p_PS3.ioram` / `.spr` / `.vram` files. i = ioram, s = m = the
+         * .spr pack, v = vram.
+         */
+        fun characterFile(fileName: String): CharacterFile? {
+            val m = CHARACTER_MODEL.matchEntire(COPY_SUFFIX.replace(fileName, "")) ?: return null
+            val g = m.groupValues
+            val part = when {
+                g[5].isNotEmpty() -> g[5].lowercase().first().let { if (it == 's') 'm' else it }
+                g[6].equals("ioram", true) -> 'i'
+                g[6].equals("spr", true) -> 'm'
+                else -> 'v'
+            }
+            return CharacterFile(g[1].lowercase(), g[2], g[3].isNotEmpty(), g[4], part)
+        }
 
         /**
          * The logical paths a mod file may stand for, best guess first.
          *
-         * Character mods use the PS3/PC pack names (`067_brolly_0_2p_i.zpak`,
-         * with i = ioram, s = spr, v = vram); the game asks for
+         * Character mods use the PS3/PC file names read by [characterFile]; the game asks for
          * `battle/character/model/chara_067_2p_model_{i,m,v}.pak`. A mod that
          * already uses logical paths (`.../battle/character/...pak`) is taken
          * at its word.
@@ -91,12 +117,9 @@ class PackIndex private constructor(private val packs: Map<String, IntArray>) {
                 out += tail
                 if (tail != tail.lowercase()) out += tail.lowercase()
             }
-            val name = parts.last()
-            CHARACTER_MODEL.matchEntire(name)?.let { m ->
-                val (id, damaged, players, part) = m.destructured
-                val kind = when (part.lowercase()) { "s" -> "m"; else -> part.lowercase() }
-                val d = if (damaged.isNotEmpty()) "D_" else ""
-                out.add(0, "battle/character/model/chara_${id}_$d${players}p_model_$kind.pak")
+            characterFile(parts.last())?.let { c ->
+                val d = if (c.damaged) "D_" else ""
+                out.add(0, "battle/character/model/chara_${c.id}_$d${c.players}p_model_${c.part}.pak")
             }
             return out
         }

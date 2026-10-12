@@ -2,6 +2,7 @@ package com.deivid22srk.restuff.mods
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.File
@@ -46,5 +47,42 @@ class Ps3ConverterTest {
             assertArrayEquals("$stem s", File(out, "${stem}_s.zpak").readBytes(), c.model)
             assertArrayEquals("$stem v", File(out, "${stem}_v.zpak").readBytes(), c.vram)
         }
+    }
+}
+
+/**
+ * Converts every character in a folder of unpacked mods (RB2_MODS_DIR) and checks the results
+ * hold together; RB2_MODEL_ORIGINAL is an X360 model pack to borrow face files from.
+ */
+class Ps3ConverterSweepTest {
+    @Test
+    fun convertsEveryCharacter() {
+        val dir = System.getenv("RB2_MODS_DIR")?.let(::File)
+        assumeTrue(dir != null && dir.isDirectory)
+        val original = System.getenv("RB2_MODEL_ORIGINAL")?.let { File(it).readBytes() }
+        val groups = dir!!.walkTopDown().filter { it.isFile }
+            .mapNotNull { f -> PackIndex.characterFile(f.name)?.let { f to it } }
+            .groupBy { (f, c) -> f.parent + "/" + c.stem }
+        val failures = mutableListOf<String>()
+        for ((stem, files) in groups) {
+            val byPart = files.associate { (f, c) -> c.part to f }
+            val i = byPart['i']; val m = byPart['m']; val v = byPart['v']
+            if (i == null || m == null || v == null) { failures += "$stem: incomplete ${byPart.keys}"; continue }
+            val r = runCatching {
+                val c = Ps3Converter.convert(i.readBytes(), m.readBytes(), v.readBytes(), original,
+                    Triple(i.name, m.name, v.name))
+                val model = Stpz.decompress(c.model)
+                val sprAt = ((model[16].toInt() and 0xFF) shl 24) or ((model[17].toInt() and 0xFF) shl 16) or
+                    ((model[18].toInt() and 0xFF) shl 8) or (model[19].toInt() and 0xFF)
+                assertEquals("SPR3", String(model, sprAt, 4, Charsets.ISO_8859_1))
+                Stpz.decompress(c.ioram); Stpz.decompress(c.vram)
+                "${model[11]} files in the model pack"
+            }
+            println("$stem: ${r.getOrElse { "FAILED ${it.message}" }}")
+            r.exceptionOrNull()?.let { failures += "$stem: ${it.message}" }
+        }
+        println("${groups.size} characters, ${failures.size} failures")
+        failures.forEach(::println)
+        assertTrue(failures.joinToString("\n"), failures.isEmpty())
     }
 }

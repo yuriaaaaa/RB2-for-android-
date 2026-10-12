@@ -24,6 +24,9 @@
       acesso direto a caminhos usa READ_EXTERNAL_STORAGE +
       requestLegacyExternalStorage.
     -->
+    <!-- GameBanana mod browser: lists, previews and downloads -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         android:minSdkVersion="30" />
     <uses-permission
@@ -67,6 +70,31 @@
             android:hardwareAccelerated="true"
             android:launchMode="singleTask"
             android:theme="@style/Theme.PortScreen" />
+
+        <!--
+            GameBanana mod browser. Also opens GameBanana mod links shared to the app
+            or tapped in a browser, and 1-click mmdl links, and installs from them.
+        -->
+        <activity
+            android:name=".ui.mods.ModBrowserActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:label="Raging Blast 2 mods"
+            android:theme="@style/Theme.PortScreen">
+            <intent-filter android:label="Install with Raging Blast 2">
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" />
+                <data android:host="gamebanana.com" />
+                <data android:pathPrefix="/mods/" />
+            </intent-filter>
+        </activity>
     </application>
 
 </manifest>

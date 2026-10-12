@@ -374,6 +374,44 @@ class ModManagerTest {
         assertArrayEquals(byteArrayOf(1, 0, 3, 2, 5, 4, 7, 6), vram.copyOfRange(0x1000, 0x1008))
     }
 
+    @Test
+    fun olderPs3NamesAreConvertedAndOneVersionIsPicked() {
+        val paths = listOf("i", "m", "v").map { "battle/character/model/chara_035_1p_model_$it.pak" }
+        afs.writeBytes(buildAfs(paths.mapIndexed { i, _ -> "" to bytes(5000 + i, 40 + i) }))
+        val index = File(root, PackIndex.FILE_NAME)
+        PackIndex.write(index, mapOf("st_pack_battle_character_pt_x360.afs" to paths))
+        fun version(folder: String, seed: Int) = listOf(
+            "Vegito SDBH/$folder/035_vegito_1_1p_PS3-i.zpak" to
+                Stpz.compress(onePak("035_vegito_1_1p_PS3-i.ioram", bytes(300, seed))),
+            "Vegito SDBH/$folder/035_vegito_1_1p_PS3-s.zpak" to Stpz.compress(ps3Model()),
+            "Vegito SDBH/$folder/035_vegito_1_1p_PS3-v.zpak" to
+                Stpz.compress(onePak("035_vegito_1_1p_PS3-v.vram", ByteArray(24) { it.toByte() })),
+        )
+        val archive = File(root, "Vegito SDBH.zip")
+        archive.outputStream().use { o -> zip(*(version("Base", 1) + version("SSJ", 2)).toTypedArray()).copyTo(o) }
+        var asked: Pair<String, List<String>>? = null
+        val mod = ModManager(game, mods, File(root, "saves"), index)
+            .install(archive, "Vegito SDBH.zip", { name, versions -> asked = name to versions; 1 })
+        assertEquals("035_vegito_1_1p" to listOf("Base", "SSJ"), asked)
+        assertEquals(3, mod.changes.size)
+        assertTrue(mod.changes.all { it.stored.startsWith("Vegito SDBH/SSJ/") })
+        val ioram = Stpz.decompress(entryBytes(AfsArchive.open(afs), 0))
+        assertArrayEquals(bytes(300, 2), ioram.copyOfRange(0x1000, 0x1000 + 300))
+    }
+
+    @Test
+    fun rarAndSevenZipNeedTheUnpacker() {
+        val archive = File(root, "mod.rar").apply { writeBytes("Rar!\u001a\u0007\u0000".toByteArray() + bytes(100, 1)) }
+        val e = runCatching { ModManager(game, mods).install(archive, "mod.rar") }.exceptionOrNull()
+        assertEquals("Only .zip mods can be installed here.", e?.message)
+        var unpacked = false
+        runCatching {
+            ModManager(game, mods, unpacker = { _, into -> unpacked = true; File(into, "x.txt").writeText("x") })
+                .install(archive, "mod.rar")
+        }
+        assertTrue(unpacked)
+    }
+
     /** STPK holding one file at 0x80, like the PS3 packs. */
     private fun onePak(name: String, data: ByteArray): ByteArray {
         val b = ByteBuffer.allocate(0x80 + data.size)

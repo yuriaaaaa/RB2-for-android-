@@ -52,6 +52,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -63,6 +64,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -76,6 +80,10 @@ import com.deivid22srk.restuff.data.GpuDriverManager
 import com.deivid22srk.restuff.game.EngineOverrides
 import com.deivid22srk.restuff.mods.ModManager
 import com.deivid22srk.restuff.mods.Mods
+import com.deivid22srk.restuff.ui.mods.MOD_ARCHIVE_MIME
+import com.deivid22srk.restuff.ui.mods.ModBrowserActivity
+import com.deivid22srk.restuff.ui.mods.ModInstallState
+import com.deivid22srk.restuff.ui.mods.VersionPickerDialog
 import com.deivid22srk.restuff.settings.FpsLimitOption
 import com.deivid22srk.restuff.settings.PortSettings
 import com.deivid22srk.restuff.settings.PortSettingsViewModel
@@ -85,6 +93,7 @@ import com.deivid22srk.restuff.ui.components.portClickable
 import com.deivid22srk.restuff.viewmodel.DataPhase
 import com.deivid22srk.restuff.viewmodel.DataSelectionUiState
 import com.deivid22srk.restuff.viewmodel.DataSelectionViewModel
+import java.io.File
 import kotlin.math.roundToInt
 
 /**
@@ -829,17 +838,11 @@ private fun DriversSection() {
 }
 
 // ======================================================================
-// Mods (.zip installed into the game folder, originals kept as .bk)
+// Mods (.zip/.rar/.7z installed into the game folder, originals kept as .bk)
 // ======================================================================
 
-private val MOD_ZIP_MIME = arrayOf(
-    "application/zip",
-    "application/octet-stream",
-    "application/x-zip-compressed",
-)
-
 /**
- * Installs zip mods into the game folder. A file the mod replaces is kept as
+ * Installs .zip/.rar/.7z mods into the game folder. A file the mod replaces is kept as
  * `<name>.bk` first; character files (.zpak) are swapped inside the game's AFS
  * archives. Removing a mod restores what it changed.
  */
@@ -866,44 +869,59 @@ private fun ModsSection() {
         installed = withContext(Dispatchers.IO) { runCatching { m?.list() }.getOrNull() ?: emptyList() }
     }
 
+    val install = remember { ModInstallState() }
+    VersionPickerDialog(install)
+    // Mods installed from the GameBanana browser show up when the person comes back.
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) scope.launch {
+                val m = manager ?: return@launch
+                installed = withContext(Dispatchers.IO) { runCatching { m.list() }.getOrDefault(installed) }
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
+    }
+    LaunchedEffect(install.busy, install.message) {
+        busy = install.busy
+        if (install.message != null) {
+            message = install.message
+            isError = install.isError
+        }
+    }
     val zipPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         val m = manager
         if (uri == null || m == null) return@rememberLauncherForActivityResult
         val name = Mods.displayName(context, uri)
-        if (!name.endsWith(".zip", ignoreCase = true)) {
-            message = "Only .zip mods can be installed for now. Extract “$name” and zip it again."
-            isError = true
-            return@rememberLauncherForActivityResult
-        }
-        busy = "Installing $name…"
+        busy = "Reading $name…"
         message = null
         scope.launch {
-            try {
-                val mod = withContext(Dispatchers.IO) {
-                    val input = context.contentResolver.openInputStream(uri)
-                        ?: throw ModManager.ModException("Couldn't open $name.")
-                    input.use { m.install(it, name) { line -> scope.launch { busy = line } } }
+            // Copied first: .rar/.7z need a real file, and the copy keeps the picker's grant short.
+            val copy = withContext(Dispatchers.IO) {
+                runCatching {
+                    val file = File(context.cacheDir, "mod-import/${name.replace('/', '_')}")
+                    file.parentFile?.mkdirs()
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        file.outputStream().use { input.copyTo(it) }
+                    } ?: throw ModManager.ModException("Couldn't open $name.")
+                    file
                 }
-                installed = withContext(Dispatchers.IO) { m.list() }
-                val files = mod.changes.count { it.kind != ModManager.Kind.SAVE }
-                val save = mod.changes.any { it.kind == ModManager.Kind.SAVE }
-                message = "Installed “${mod.name}”: $files file" + (if (files == 1) "" else "s") +
-                    " replaced, originals kept as .bk." +
-                    (if (save) " Your save was replaced too; the old one is kept as DB_SAVE.bk." else "") +
-                    mod.notes.joinToString("") { " $it" } +
-                    mod.skipped.filter { it.reason != "not a game file" && it.reason != "another copy of the save" }
-                        .let { worth ->
-                            if (worth.isEmpty()) "" else " Skipped ${worth.size}: " +
-                                worth.take(3).joinToString("; ") { "${it.path.substringAfterLast('/')} (${it.reason})" }
-                        }
-                isError = false
-            } catch (e: Exception) {
-                message = e.message ?: "Couldn't install the mod."
-                isError = true
             }
-            busy = null
+            val file = copy.getOrElse {
+                message = it.message ?: "Couldn't read $name."
+                isError = true
+                busy = null
+                return@launch
+            }
+            try {
+                install.install(m, file, name)
+            } finally {
+                withContext(Dispatchers.IO) { file.delete() }
+            }
+            installed = withContext(Dispatchers.IO) { m.list() }
         }
     }
 
@@ -911,7 +929,7 @@ private fun ModsSection() {
         SectionHeader("Mods")
 
         Text(
-            text = "Install a mod from a .zip. Files it replaces in your game folder are kept " +
+            text = "Install a mod from a .zip, .rar or .7z, or get one from GameBanana. Files it replaces in your game folder are kept " +
                 "as .bk backups, and character files (.zpak) are swapped inside the game's " +
                 ".afs packs. Remove a mod to put the originals back. PS3/PC character " +
                 "files are converted to the Xbox 360 format as they install.",
@@ -975,7 +993,7 @@ private fun ModsSection() {
                         accent.copy(alpha = if (busy != null) 0.2f else 0.55f),
                         RoundedCornerShape(PortPalette.radiusSm)
                     )
-                    .portClickable(enabled = busy == null) { zipPicker.launch(MOD_ZIP_MIME) }
+                    .portClickable(enabled = busy == null) { zipPicker.launch(MOD_ARCHIVE_MIME) }
                     .padding(horizontal = 16.dp, vertical = 13.dp),
                 contentAlignment = Alignment.Center
             ) {
@@ -1004,12 +1022,29 @@ private fun ModsSection() {
                             modifier = Modifier.size(16.dp)
                         )
                         Text(
-                            text = "Install mod (.zip)",
+                            text = "Install mod (.zip, .rar, .7z)",
                             color = accent,
                             style = PortType.caption
                         )
                     }
                 }
+            }
+
+            Spacer(Modifier.height(10.dp))
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .clip(RoundedCornerShape(PortPalette.radiusSm))
+                    .border(1.dp, PortPalette.ghostBorder, RoundedCornerShape(PortPalette.radiusSm))
+                    .portClickable(enabled = busy == null) {
+                        context.startActivity(android.content.Intent(context, ModBrowserActivity::class.java))
+                    }
+                    .padding(horizontal = 16.dp, vertical = 13.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(text = "Get mods from GameBanana", color = PortPalette.textPrimary, style = PortType.caption)
             }
         }
 

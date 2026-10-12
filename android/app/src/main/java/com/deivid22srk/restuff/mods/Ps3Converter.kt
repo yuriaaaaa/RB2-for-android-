@@ -23,11 +23,26 @@ object Ps3Converter {
 
     data class Character(val ioram: ByteArray, val model: ByteArray, val vram: ByteArray)
 
-    /** Converts one character. Inputs and outputs are STPZ-compressed .zpak files. */
-    fun convert(i: ByteArray, s: ByteArray, v: ByteArray): Character {
-        val di = Stpz.decompress(i)
-        val ds = Stpz.decompress(s)
-        val dv = Stpz.decompress(v)
+    /**
+     * Converts one character. Inputs are .zpak files (STPZ or plain STPK) or, from older
+     * mods, the loose `.ioram`, `.spr` and `.vram` files ([names] gives their file names).
+     * A loose .spr lacks the face animation files that ride along in the pack, so they are
+     * taken from [originalModel], the game's own pack for that slot. Outputs are STPZ.
+     */
+    fun convert(
+        i: ByteArray,
+        s: ByteArray,
+        v: ByteArray,
+        originalModel: ByteArray? = null,
+        names: Triple<String, String, String> = Triple("ioram.ioram", "model.spr", "vram.vram"),
+    ): Character {
+        val di = asPack(i, names.first)
+        val dv = asPack(v, names.third)
+        val ds = if (String(s, 0, 4, Charsets.ISO_8859_1) == "SPRP") {
+            withOriginalExtras(s, names.second, originalModel?.let { Stpz.decompress(it) })
+        } else {
+            Stpz.decompress(s)
+        }
         val (iname, ioff, isz) = entries(di).singleOrNull() ?: throw ConvertException("the _i pack should hold one file")
         val (vname, voff, vsz) = entries(dv).singleOrNull() ?: throw ConvertException("the _v pack should hold one file")
         val ioram = di.copyOfRange(ioff, ioff + isz)
@@ -112,6 +127,45 @@ object Ps3Converter {
     )
 
     private fun x360Name(name: String) = name.replace("_PS3.", "X360.")
+
+    /** The STPK inside [d]: unpacked from STPZ, as it is, or a loose file wrapped as one. */
+    private fun asPack(d: ByteArray, name: String): ByteArray {
+        val head = if (d.size >= 4) String(d, 0, 4, Charsets.ISO_8859_1) else ""
+        return when (head) {
+            "STPZ" -> Stpz.decompress(d)
+            "STPK" -> d
+            else -> pack(listOf(name to d))
+        }
+    }
+
+    /** A pack of the loose [spr] followed by everything but the .spr from [original]. */
+    private fun withOriginalExtras(spr: ByteArray, name: String, original: ByteArray?): ByteArray {
+        val files = mutableListOf(name to spr)
+        if (original != null) {
+            for ((n, o, size) in entries(original)) {
+                if (!n.endsWith(".spr")) files += n to original.copyOfRange(o, o + size)
+            }
+        }
+        return pack(files)
+    }
+
+    /** STPK holding [files], each at a 16-byte boundary. */
+    private fun pack(files: List<Pair<String, ByteArray>>): ByteArray {
+        var at = alignUp(16 + files.size * 48, 16)
+        val offsets = files.map { (_, d) -> at.also { at = alignUp(at + d.size, 16) } }
+        val out = ByteArray(at)
+        "STPK".toByteArray(Charsets.ISO_8859_1).copyInto(out, 0)
+        putBe32(out, 4, 1)
+        putBe32(out, 8, files.size)
+        putBe32(out, 12, 16)
+        files.forEachIndexed { k, (n, d) ->
+            putBe32(out, 16 + k * 48, offsets[k])
+            putBe32(out, 16 + k * 48 + 4, d.size)
+            putName(out, 16 + k * 48 + 16, n)
+            d.copyInto(out, offsets[k])
+        }
+        return out
+    }
 
     /** STPK with one GPU blob at 0x1000, the way the 360 packs ioram/vram. */
     private fun singlePak(name: String, data: ByteArray): ByteArray {

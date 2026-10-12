@@ -118,6 +118,46 @@ for vtlib in libvulkan_vortek.so libvortekrenderer.so; do
 done
 echo "  vortek: 2 libs copiadas para jniLibs"
 
+# --- [1f] libmodarchive (xz + libarchive): .rar/.7z/.zip mods -----------
+# From the Marathon Recompiled Android port. Sources are fetched into build/ once.
+XZ_TAG=v5.6.4
+LIBARCHIVE_TAG=v3.8.1
+ARCHIVE_WORK="$ROOT/build/modarchive-$ABI"
+if [[ ! -f "$ARCHIVE_WORK/modarchive/libmodarchive.so" ]]; then
+    echo "== modarchive: xz $XZ_TAG + libarchive $LIBARCHIVE_TAG ($ABI) =="
+    mkdir -p "$ARCHIVE_WORK/src"
+    for spec in "xz https://github.com/tukaani-project/xz.git $XZ_TAG" \
+                "libarchive https://github.com/libarchive/libarchive.git $LIBARCHIVE_TAG"; do
+        set -- $spec
+        [[ -d "$ARCHIVE_WORK/src/$1/.git" ]] || git clone -q --depth 1 --branch "$3" "$2" "$ARCHIVE_WORK/src/$1"
+    done
+    ARCHIVE_CMAKE=(-G Ninja -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" -DANDROID_ABI="$ABI"
+        -DANDROID_PLATFORM=android-29 -DCMAKE_BUILD_TYPE=Release)
+    PREFIX="$ARCHIVE_WORK/prefix"
+    cmake -S "$ARCHIVE_WORK/src/xz" -B "$ARCHIVE_WORK/xz" "${ARCHIVE_CMAKE[@]}" \
+        -DBUILD_SHARED_LIBS=OFF -DXZ_TOOL_XZ=OFF -DXZ_TOOL_XZDEC=OFF -DXZ_TOOL_LZMADEC=OFF \
+        -DXZ_TOOL_LZMAINFO=OFF -DXZ_TOOL_SCRIPTS=OFF -DXZ_TOOL_SYMLINKS=OFF -DXZ_TOOL_SYMLINKS_LZMA=OFF \
+        -DXZ_DOC=OFF -DXZ_NLS=OFF -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX="$PREFIX"
+    ninja -C "$ARCHIVE_WORK/xz" install
+    cmake -S "$ARCHIVE_WORK/src/libarchive" -B "$ARCHIVE_WORK/libarchive" "${ARCHIVE_CMAKE[@]}" \
+        -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_PREFIX_PATH="$PREFIX" \
+        -DLIBLZMA_INCLUDE_DIR="$PREFIX/include" -DLIBLZMA_LIBRARY="$PREFIX/lib/liblzma.a" \
+        -DENABLE_LZMA=ON -DENABLE_ZLIB=ON -DENABLE_BZip2=OFF -DENABLE_LZ4=OFF -DENABLE_ZSTD=OFF \
+        -DENABLE_LIBB2=OFF -DENABLE_OPENSSL=OFF -DENABLE_MBEDTLS=OFF -DENABLE_NETTLE=OFF \
+        -DENABLE_LIBXML2=OFF -DENABLE_EXPAT=OFF -DENABLE_PCREPOSIX=OFF -DENABLE_PCRE2POSIX=OFF \
+        -DENABLE_LIBGCC=OFF -DENABLE_CNG=OFF -DENABLE_TAR=OFF -DENABLE_CPIO=OFF -DENABLE_CAT=OFF \
+        -DENABLE_UNZIP=OFF -DENABLE_XATTR=OFF -DENABLE_ACL=OFF -DENABLE_ICONV=OFF -DENABLE_TEST=OFF \
+        -DENABLE_INSTALL=ON -DENABLE_WERROR=OFF
+    ninja -C "$ARCHIVE_WORK/libarchive" archive_static
+    cmake -S "$ROOT/native/modarchive" -B "$ARCHIVE_WORK/modarchive" "${ARCHIVE_CMAKE[@]}" \
+        -DLIBARCHIVE_SOURCE_DIR="$ARCHIVE_WORK/src/libarchive" \
+        -DLIBARCHIVE_STATIC_LIB="$ARCHIVE_WORK/libarchive/libarchive/libarchive.a" \
+        -DLIBLZMA_STATIC_LIB="$PREFIX/lib/liblzma.a"
+    ninja -C "$ARCHIVE_WORK/modarchive"
+fi
+cp "$ARCHIVE_WORK/modarchive/libmodarchive.so" "$JNILIBS_DIR/"
+echo "  modarchive: libmodarchive.so copiada para jniLibs"
+
 # --- [2] librestuff.so -----------------------------------------------------
 # RB2_SKIP_GAME=1: build only the SDK libraries with the port's overlays (no default.xex
 # needed), as a build check. Nothing is packaged.
@@ -252,7 +292,10 @@ test -f "$JNILIBS_DIR/libc++_shared.so" || { echo "ERRO FATAL: cp falhou" >&2; e
 READELF=$(find "$NDK_DIR/toolchains/llvm/prebuilt" -name llvm-readelf 2>/dev/null | head -1)
 if [[ -n "$READELF" ]]; then
     for so in "$JNILIBS_DIR"/*.so; do
-        if ! "$READELF" -h "$so" | grep -q "AArch64"; then
+        # Read the header first: grep -q would close the pipe early, and under pipefail
+        # readelf's SIGPIPE would fail a library that is fine.
+        header=$("$READELF" -h "$so")
+        if [[ "$header" != *AArch64* ]]; then
             echo "ERROR: $so is not an AArch64 library" >&2
             exit 1
         fi

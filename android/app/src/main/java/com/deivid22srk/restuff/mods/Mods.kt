@@ -21,7 +21,9 @@ object Mods {
         val modsDir = File(gameRoot.absoluteFile.parentFile ?: context.filesDir, "mods")
         // The game writes pack-hashes.bin next to the saves folder when it starts.
         val packIndex = File(GamePaths.savesDir(context).parentFile ?: context.filesDir, PackIndex.FILE_NAME)
-        return ModManager(gameRoot, modsDir, GamePaths.savesDir(context), packIndex)
+        return ModManager(gameRoot, modsDir, GamePaths.savesDir(context), packIndex) { archive, into ->
+            ArchiveExtractor.extract(archive, into)
+        }
     }
 
     fun displayName(context: Context, uri: Uri): String {

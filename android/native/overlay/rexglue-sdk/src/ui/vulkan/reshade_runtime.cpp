@@ -258,6 +258,8 @@ bool DeclaresTechnique(const std::string& source, const std::string& name) {
   return false;
 }
 
+constexpr uint64_t kFramesUntilOk = 120;
+
 }  // namespace
 
 std::unique_ptr<Runtime> Runtime::CreateIfEnabled(const VulkanDevice* device) {
@@ -290,6 +292,8 @@ void RuntimeDeleter::operator()(Runtime* runtime) const { delete runtime; }
 void Runtime::Log(const std::string& line) {
   log_ += line;
   if (log_.empty() || log_.back() != '\n') log_ += '\n';
+  // Written at every step, so a run that hangs or crashes still shows how far it got.
+  WriteLog();
 }
 
 void Runtime::WriteLog() {
@@ -1020,6 +1024,7 @@ bool Runtime::Load(uint32_t width, uint32_t height, uint32_t slots, VkFormat dst
     }
     auto effect = std::make_unique<Effect>();
     effect->section = path.filename().string();
+    Log("compiling " + path.filename().string());
     effect->compiled = CompileEffect(path, options);
     if (!effect->compiled.ok) {
       Log("error: " + effect->section + " didn't compile:\n" + effect->compiled.errors);
@@ -1030,6 +1035,7 @@ bool Runtime::Load(uint32_t width, uint32_t height, uint32_t slots, VkFormat dst
     for (const Want& o : wants) {
       if (ToLower(o.file) == ToLower(w.file)) names.push_back(o.technique);
     }
+    Log("creating pipelines for " + effect->section);
     if (!LoadEffect(*effect, preset, names)) {
       Log("error: " + effect->section + " couldn't be set up; it is skipped");
       effect->ready = false;
@@ -1224,6 +1230,7 @@ bool Runtime::Apply(VkCommandBuffer cb, VkImage src, VkImage dst, VkImageView ds
       return false;
     }
     REXLOG_INFO("ReShade: {} technique(s) on {}x{}", order_.size(), width, height);
+    Log("recording the first frame");
   }
   slot %= slots_;
 
@@ -1231,6 +1238,13 @@ bool Runtime::Apply(VkCommandBuffer cb, VkImage src, VkImage dst, VkImageView ds
   float frame_ms = std::chrono::duration<float, std::milli>(now - last_).count();
   last_ = now;
   ++frame_count_;
+  if (frame_count_ == 2) Log("first frame recorded");
+  if (frame_count_ == kFramesUntilOk) {
+    // The launcher's freeze guard: it turns ReShade off when a run never gets here.
+    Log(std::to_string(kFramesUntilOk) + " frames ran");
+    std::error_code ec;
+    std::filesystem::remove(root_ / ".starting", ec);
+  }
 
   // Source textures go up on the first frame; their staging buffers live a few frames.
   if (!pending_uploads_.empty()) {

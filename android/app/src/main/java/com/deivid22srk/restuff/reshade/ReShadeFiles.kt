@@ -34,6 +34,9 @@ object ReShadeFiles {
 
     fun preset(root: File): File = File(root, PRESET_NAME)
 
+    /** Present while a game run with ReShade hasn't yet got through its first frames. */
+    fun startMarker(root: File): File = File(root, ".starting")
+
     fun ensure(root: File): Boolean {
         File(root, "Shaders").mkdirs()
         File(root, "Textures").mkdirs()

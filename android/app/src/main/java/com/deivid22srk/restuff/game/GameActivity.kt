@@ -217,8 +217,22 @@ class GameActivity : SDLActivity() {
             }
         }
         // ---- ReShade (0.4.0): effects from Internal storage/Raging Blast 2/reshade ----
-        val reshadeDir = if (settings.reshadeEnabled && publicLogDir != null) ReShadeFiles.folder() else null
+        var reshadeDir = if (settings.reshadeEnabled && publicLogDir != null) ReShadeFiles.folder() else null
+        // Freeze guard: the engine deletes .starting once ReShade has run 120 frames.
+        // If it's still there, the last run with ReShade froze or crashed first.
+        if (reshadeDir != null && ReShadeFiles.startMarker(reshadeDir).exists()) {
+            runCatching { PortSettingsRepository(this).save(settings.copy(reshadeEnabled = false)) }
+            runOnUiThread {
+                Toast.makeText(
+                    this,
+                    "ReShade is off: the last run with it froze or crashed. See ReShade.log in Settings.",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+            reshadeDir = null
+        }
         if (reshadeDir != null && ReShadeFiles.readTechniques(ReShadeFiles.preset(reshadeDir)).isNotEmpty()) {
+            runCatching { ReShadeFiles.startMarker(reshadeDir).writeText("") }
             cfg["reshade_enabled"] = "true"
             cfg["reshade_path"] = "\"${reshadeDir.absolutePath}\""
             cfg["reshade_preset"] = "\"${ReShadeFiles.preset(reshadeDir).absolutePath}\""

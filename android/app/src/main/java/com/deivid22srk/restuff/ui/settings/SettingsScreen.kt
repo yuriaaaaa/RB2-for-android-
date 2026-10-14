@@ -1188,7 +1188,11 @@ private fun ReShadeSection(
             subtitle = if (active.isEmpty()) "Pick at least one effect below" else
                 "${active.size} effect${if (active.size == 1) "" else "s"} on",
             checked = enabled,
-            onChange = onEnabledChange
+            onChange = { checked ->
+                // Turning it back on clears the freeze guard's marker.
+                if (checked) runCatching { ReShadeFiles.startMarker(root).delete() }
+                onEnabledChange(checked)
+            }
         )
         Hairline()
         Spacer(Modifier.height(8.dp))

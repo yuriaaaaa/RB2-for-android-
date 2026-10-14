@@ -47,6 +47,16 @@ set(REXUI_VULKAN_SOURCES
     vulkan/vulkan_submission_tracker.cpp
     vulkan/vulkan_upload_buffer_pool.cpp
     vulkan/vulkan_util.cpp
+    # Android port: ReShade effects (ReShadeFX compiler + a small Vulkan runtime)
+    vulkan/reshade_effects.cpp
+    vulkan/reshade_runtime.cpp
+    vulkan/reshadefx/effect_codegen_spirv.cpp
+    vulkan/reshadefx/effect_expression.cpp
+    vulkan/reshadefx/effect_lexer.cpp
+    vulkan/reshadefx/effect_parser_exp.cpp
+    vulkan/reshadefx/effect_parser_stmt.cpp
+    vulkan/reshadefx/effect_preprocessor.cpp
+    vulkan/reshadefx/effect_symbol_table.cpp
 )
 
 # D3D12 UI backend
@@ -121,6 +131,23 @@ target_link_libraries(rexui PUBLIC
     SDL3::SDL3
 )
 target_link_libraries(rexui PRIVATE utf8cpp)
+
+# ReShadeFX: spirv.hpp / GLSL.std.450.h, and no precompiled header (its sources
+# include their own headers by relative name).
+target_include_directories(rexui PRIVATE
+    ${REXGLUE_ROOT}/thirdparty/spirv-headers/include/spirv/unified1
+    ${REXGLUE_ROOT}/src/ui/vulkan/reshadefx
+)
+set_source_files_properties(
+    vulkan/reshadefx/effect_codegen_spirv.cpp
+    vulkan/reshadefx/effect_expression.cpp
+    vulkan/reshadefx/effect_lexer.cpp
+    vulkan/reshadefx/effect_parser_exp.cpp
+    vulkan/reshadefx/effect_parser_stmt.cpp
+    vulkan/reshadefx/effect_preprocessor.cpp
+    vulkan/reshadefx/effect_symbol_table.cpp
+    vulkan/reshade_effects.cpp
+    PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
 if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include")
     target_include_directories(rexui PRIVATE

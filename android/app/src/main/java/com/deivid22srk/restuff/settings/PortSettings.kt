@@ -74,6 +74,9 @@ data class PortSettings(
     /** Extra engine options, one `key = value` per line; they replace or add
      *  keys in the restuff.toml the launcher writes on every boot. */
     val engineOverrides: String = "",
+    /** ReShade effects on the game image (cvar reshade_enabled; the effects
+     *  themselves are in the preset in Internal storage/Raging Blast 2/reshade). */
+    val reshadeEnabled: Boolean = false,
 )
 
 /**
@@ -100,6 +103,7 @@ class PortSettingsRepository(context: Context) {
             particlesEnabled = prefs.getBoolean(K_PARTICLES, true),
             reduceMotionOverride = prefs.getBoolean(K_REDUCE_MOTION, false),
             engineOverrides = prefs.getString(K_ENGINE_OVERRIDES, "") ?: "",
+            reshadeEnabled = prefs.getBoolean(K_RESHADE, false),
         )
     }
 
@@ -119,6 +123,7 @@ class PortSettingsRepository(context: Context) {
             .putBoolean(K_PARTICLES, s.particlesEnabled)
             .putBoolean(K_REDUCE_MOTION, s.reduceMotionOverride)
             .putString(K_ENGINE_OVERRIDES, s.engineOverrides)
+            .putBoolean(K_RESHADE, s.reshadeEnabled)
             .apply()
     }
 
@@ -140,5 +145,6 @@ class PortSettingsRepository(context: Context) {
         const val K_PARTICLES = "particles_enabled"     // mesma chave da v1.0
         const val K_REDUCE_MOTION = "reduce_motion"     // mesma chave da v1.0
         const val K_ENGINE_OVERRIDES = "wet_engine_overrides"
+        const val K_RESHADE = "reshade_enabled"
     }
 }

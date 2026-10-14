@@ -42,6 +42,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
@@ -80,6 +81,7 @@ import com.deivid22srk.restuff.data.GpuDriverManager
 import com.deivid22srk.restuff.game.EngineOverrides
 import com.deivid22srk.restuff.mods.ModManager
 import com.deivid22srk.restuff.mods.Mods
+import com.deivid22srk.restuff.reshade.ReShadeFiles
 import com.deivid22srk.restuff.ui.mods.MOD_ARCHIVE_MIME
 import com.deivid22srk.restuff.ui.mods.ModBrowserActivity
 import com.deivid22srk.restuff.ui.mods.ModInstallState
@@ -317,6 +319,16 @@ fun SettingsScreen(
 
             // ============================ MODS ===========================
             ModsSection()
+
+            SectionGap()
+
+            // ============================ RESHADE ========================
+            ReShadeSection(
+                enabled = settings.reshadeEnabled,
+                onEnabledChange = { checked ->
+                    onSettingsChange { it.copy(reshadeEnabled = checked) }
+                }
+            )
 
             SectionGap()
 
@@ -1055,6 +1067,305 @@ private fun ModsSection() {
                 color = if (isError) PortPalette.error else PortPalette.success,
                 style = PortType.rowSub
             )
+        }
+    }
+}
+
+/**
+ * ReShade: the effects the engine runs on the game image (see
+ * reshade_runtime.cpp). Shaders live in Internal storage/Raging Blast 2/reshade
+ * like a PC install; this section picks the techniques and their order and
+ * writes them to the preset. Effect values come from the preset's [File.fx]
+ * sections, so a preset made on PC can be imported as it is.
+ */
+@Composable
+private fun ReShadeSection(
+    enabled: Boolean,
+    onEnabledChange: (Boolean) -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val accent = PortBranding.config.accent
+    val root = remember { ReShadeFiles.folder() }
+    val preset = remember { ReShadeFiles.preset(root) }
+
+    var available by remember { mutableStateOf<List<ReShadeFiles.Technique>>(emptyList()) }
+    var active by remember { mutableStateOf<List<String>>(emptyList()) }
+    var log by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf<String?>(null) }
+    var message by remember { mutableStateOf<String?>(null) }
+    var isError by remember { mutableStateOf(false) }
+    var showAll by remember { mutableStateOf(false) }
+    var showLog by remember { mutableStateOf(false) }
+    var reachable by remember { mutableStateOf(true) }
+
+    suspend fun refresh() {
+        withContext(Dispatchers.IO) {
+            reachable = runCatching { ReShadeFiles.ensure(root) }.getOrDefault(false)
+            available = runCatching { ReShadeFiles.scan(root) }.getOrDefault(emptyList())
+            active = runCatching { ReShadeFiles.readTechniques(preset) }.getOrDefault(emptyList())
+            log = ReShadeFiles.lastLog(root)
+        }
+    }
+    fun save(list: List<String>) {
+        active = list
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching { ReShadeFiles.writeTechniques(preset, list) }
+            }.onFailure {
+                message = "Couldn't write the preset: ${it.message}"
+                isError = true
+            }
+        }
+    }
+    fun run(label: String, work: suspend () -> String) {
+        if (busy != null) return
+        busy = label
+        message = null
+        scope.launch {
+            try {
+                message = work()
+                isError = false
+            } catch (e: Exception) {
+                message = e.message ?: "Something went wrong."
+                isError = true
+            }
+            refresh()
+            busy = null
+        }
+    }
+
+    LaunchedEffect(Unit) { refresh() }
+    // The log changes after a run, so read it again on return from the game.
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) scope.launch { refresh() }
+        }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
+    }
+
+    val packPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        run("Installing shaders…") {
+            val count = withContext(Dispatchers.IO) {
+                context.contentResolver.openInputStream(uri)?.use { ReShadeFiles.installPack(it, root) }
+                    ?: throw java.io.IOException("Couldn't open the file.")
+            }
+            if (count == 0) throw java.io.IOException("No Shaders or Textures folder in that zip.")
+            "Added $count shader files."
+        }
+    }
+    val presetPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        run("Importing preset…") {
+            withContext(Dispatchers.IO) {
+                if (preset.isFile) preset.copyTo(File(root, ReShadeFiles.PRESET_NAME + ".bk"), overwrite = true)
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    preset.outputStream().use { input.copyTo(it) }
+                } ?: throw java.io.IOException("Couldn't open the file.")
+            }
+            "Preset imported. The old one is kept as ${ReShadeFiles.PRESET_NAME}.bk."
+        }
+    }
+
+    Column {
+        SectionHeader("ReShade effects")
+
+        Text(
+            text = "Runs ReShade .fx effects (sharpening, anti-aliasing, color grading…) on the " +
+                "game image. Pick effects below, in the order they run. Their settings come " +
+                "from the preset, so a ReShade preset made on PC works too. Effects that need " +
+                "the depth buffer don't work here, and heavy ones cost frames.",
+            color = PortPalette.textSecondary,
+            style = PortType.rowSub
+        )
+        Spacer(Modifier.height(6.dp))
+
+        ToggleRow(
+            label = "ReShade",
+            subtitle = if (active.isEmpty()) "Pick at least one effect below" else
+                "${active.size} effect${if (active.size == 1) "" else "s"} on",
+            checked = enabled,
+            onChange = onEnabledChange
+        )
+        Hairline()
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = "Folder: " + root.absolutePath,
+            color = PortPalette.textTertiary,
+            style = PortType.mono
+        )
+        if (!reachable) {
+            Text(
+                text = "The folder can't be created. Grant \"All files access\" to the app.",
+                color = PortPalette.error,
+                style = PortType.rowSub
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+
+        // Effects that run, in order.
+        if (active.isNotEmpty()) {
+            SettingLabel("Running, in order")
+            Spacer(Modifier.height(4.dp))
+            active.forEachIndexed { index, id ->
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                ) {
+                    Text(
+                        text = "${index + 1}",
+                        color = accent,
+                        style = PortType.mono.copy(fontSize = 12.sp),
+                        modifier = Modifier.width(24.dp)
+                    )
+                    Column(Modifier.weight(1f)) {
+                        Text(text = id.substringBefore('@'), color = PortPalette.textPrimary, style = PortType.rowLabel)
+                        if ('@' in id) {
+                            Text(text = id.substringAfter('@'), color = PortPalette.textSecondary, style = PortType.rowSub)
+                        }
+                    }
+                    if (index > 0) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier.size(44.dp).portClickable {
+                                save(active.toMutableList().apply { add(index - 1, removeAt(index)) })
+                            }
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.KeyboardArrowUp,
+                                contentDescription = "Run earlier",
+                                tint = PortPalette.textSecondary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier.size(44.dp).portClickable { save(active - id) }
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.DeleteOutline,
+                            contentDescription = "Turn off",
+                            tint = PortPalette.error.copy(alpha = 0.7f),
+                            modifier = Modifier.size(17.dp)
+                        )
+                    }
+                }
+                Hairline()
+            }
+            Spacer(Modifier.height(14.dp))
+        }
+
+        // Effects that can be added.
+        val activeNames = active.toSet()
+        val addable = available.filter { it.id !in activeNames && it.name !in activeNames }
+        if (available.isEmpty()) {
+            Text(
+                text = "No effects yet. Download the standard shaders, or put .fx files in Shaders/.",
+                color = PortPalette.textTertiary,
+                style = PortType.rowSub
+            )
+        } else if (addable.isNotEmpty()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).portClickable { showAll = !showAll }
+            ) {
+                Text(
+                    text = (if (showAll) "Hide" else "Add an effect") + " (${addable.size} available)",
+                    color = accent,
+                    style = PortType.caption
+                )
+            }
+            if (showAll) {
+                addable.forEach { technique ->
+                    DriverOptionRow(
+                        title = technique.name,
+                        subtitle = technique.file,
+                        selected = false,
+                        onSelect = { save(active + technique.id) },
+                        onDelete = null
+                    )
+                    Hairline()
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+        val buttons = listOf(
+            "Download standard shaders" to {
+                run("Downloading shaders…") {
+                    val total = ReShadeFiles.STANDARD_PACKS.sumOf { pack ->
+                        busy = "Downloading ${pack.name}…"
+                        withContext(Dispatchers.IO) { ReShadeFiles.downloadPack(pack, root) }
+                    }
+                    "Installed $total files from the ReShade and SweetFX shader packs."
+                }
+            },
+            "Add shader pack (.zip)" to { packPicker.launch(arrayOf("application/zip", "application/octet-stream")) },
+            "Import preset (.ini)" to { presetPicker.launch(arrayOf("*/*")) },
+        )
+        buttons.forEachIndexed { i, (label, action) ->
+            if (i > 0) Spacer(Modifier.height(10.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .clip(RoundedCornerShape(PortPalette.radiusSm))
+                    .border(
+                        1.dp,
+                        if (i == 0) accent.copy(alpha = if (busy != null) 0.2f else 0.55f) else PortPalette.ghostBorder,
+                        RoundedCornerShape(PortPalette.radiusSm)
+                    )
+                    .portClickable(enabled = busy == null) { action() }
+                    .padding(horizontal = 16.dp, vertical = 13.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                val status = busy
+                if (i == 0 && status != null) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        CircularProgressIndicator(modifier = Modifier.size(15.dp), strokeWidth = 2.dp, color = accent)
+                        Text(text = status, color = accent.copy(alpha = 0.7f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                } else {
+                    Text(
+                        text = label,
+                        color = if (i == 0) accent else PortPalette.textPrimary,
+                        style = PortType.caption
+                    )
+                }
+            }
+        }
+
+        message?.let { msg ->
+            Spacer(Modifier.height(10.dp))
+            Text(text = msg, color = if (isError) PortPalette.error else PortPalette.success, style = PortType.rowSub)
+        }
+
+        log?.let { text ->
+            Spacer(Modifier.height(12.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp).portClickable { showLog = !showLog }
+            ) {
+                val failed = text.lineSequence().any { it.startsWith("error") }
+                Text(
+                    text = (if (showLog) "Hide" else "Show") + " last run's log" +
+                        if (failed) " (has errors)" else "",
+                    color = if (failed) PortPalette.error else PortPalette.textSecondary,
+                    style = PortType.caption
+                )
+            }
+            if (showLog) {
+                Text(
+                    text = text,
+                    color = PortPalette.textTertiary,
+                    style = PortType.mono.copy(fontSize = 10.5.sp),
+                    modifier = Modifier.horizontalScroll(rememberScrollState())
+                )
+            }
         }
     }
 }

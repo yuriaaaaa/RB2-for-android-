@@ -10,6 +10,7 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.Toast
 import com.deivid22srk.restuff.data.GamePaths
+import com.deivid22srk.restuff.reshade.ReShadeFiles
 import com.deivid22srk.restuff.data.GpuDriverManager
 import com.deivid22srk.restuff.settings.PortSettings
 import com.deivid22srk.restuff.settings.PortSettingsRepository
@@ -214,6 +215,15 @@ class GameActivity : SDLActivity() {
                     Toast.LENGTH_SHORT,
                 ).show()
             }
+        }
+        // ---- ReShade (0.4.0): effects from Internal storage/Raging Blast 2/reshade ----
+        val reshadeDir = if (settings.reshadeEnabled && publicLogDir != null) ReShadeFiles.folder() else null
+        if (reshadeDir != null && ReShadeFiles.readTechniques(ReShadeFiles.preset(reshadeDir)).isNotEmpty()) {
+            cfg["reshade_enabled"] = "true"
+            cfg["reshade_path"] = "\"${reshadeDir.absolutePath}\""
+            cfg["reshade_preset"] = "\"${ReShadeFiles.preset(reshadeDir).absolutePath}\""
+        } else {
+            cfg["reshade_enabled"] = "false"
         }
         // ---- GPU fixes and diagnostics carried over from the WET port ----
         // (the SDK overlays keep their wet_ names). Their default paths point at

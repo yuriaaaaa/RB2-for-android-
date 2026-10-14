@@ -28,6 +28,8 @@
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
+#include "reshade_runtime.h"
+
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 #include <ffx_api/ffx_api.h>
 #include <ffx_api/ffx_upscale.h>
@@ -290,6 +292,8 @@ VulkanPresenter::~VulkanPresenter() {
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   DestroyTemporalUpscalerContext();
 #endif
+  reshade_.reset();
+  reshade_output_.reset();
 
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
@@ -1730,6 +1734,34 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     // the consumer critical section now as everything here either will be using
     // the new reference or is exclusively owned by main target painting (and
     // multiple threads can't paint the main target at the same time).
+  }
+
+  // Android port: ReShade effects. They read the guest frame and write
+  // reshade_output_, which is then painted instead (scaling, letterbox and the
+  // presenter's own effects apply to it as usual).
+  if (guest_output_image) {
+    if (!reshade_checked_) {
+      reshade_checked_ = true;
+      reshade_.reset(reshade::Runtime::CreateIfEnabled(vulkan_device_).release());
+    }
+    if (reshade_) {
+      const VkExtent2D extent = guest_output_image->extent();
+      if (!reshade_output_ || reshade_output_->extent().width != extent.width ||
+          reshade_output_->extent().height != extent.height ||
+          reshade_->NeedsRebuild(extent.width, extent.height)) {
+        // Nothing in flight may still use the effect images being replaced.
+        paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
+        reshade_output_ = GuestOutputImage::Create(vulkan_device_, extent.width, extent.height);
+      }
+      if (reshade_output_ &&
+          reshade_->Apply(draw_command_buffer, guest_output_image->image(),
+                          reshade_output_->image(), reshade_output_->view(), kGuestOutputFormat,
+                          extent.width, extent.height,
+                          uint32_t(current_paint_submission_index % paint_submission_count),
+                          uint32_t(paint_submission_count))) {
+        guest_output_image = reshade_output_;
+      }
+    }
   }
 
   if (guest_output_image) {

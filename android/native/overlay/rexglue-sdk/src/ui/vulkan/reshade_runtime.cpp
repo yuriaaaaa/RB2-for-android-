@@ -263,7 +263,36 @@ constexpr uint64_t kFramesUntilOk = 120;
 }  // namespace
 
 std::unique_ptr<Runtime> Runtime::CreateIfEnabled(const VulkanDevice* device) {
-  if (!REXCVAR_GET(reshade_enabled) || REXCVAR_GET(reshade_preset).empty()) return nullptr;
+  if (!REXCVAR_GET(reshade_enabled)) return nullptr;
+  return Create(device);
+}
+
+bool LiveSwitch::Poll(bool* enabled) {
+  if (calls_++ % 30) return false;
+  const std::string root = REXCVAR_GET(reshade_path), preset = REXCVAR_GET(reshade_preset);
+  if (root.empty()) return false;
+  std::error_code ec;
+  const std::filesystem::path live = std::filesystem::path(root) / ".live";
+  auto live_time = std::filesystem::last_write_time(live, ec);
+  if (ec) live_time = {};
+  auto preset_time = preset.empty() ? std::filesystem::file_time_type{}
+                                    : std::filesystem::last_write_time(preset, ec);
+  if (ec) preset_time = {};
+  // The first look only records the state the game started with.
+  const bool changed = started_ && (live_time != live_time_ || preset_time != preset_time_);
+  started_ = true;
+  live_time_ = live_time;
+  preset_time_ = preset_time;
+  if (!changed) return false;
+  std::ifstream in(live);
+  char c = '0';
+  if (in) in >> c;
+  *enabled = in ? c == '1' : bool(REXCVAR_GET(reshade_enabled));
+  return true;
+}
+
+std::unique_ptr<Runtime> Runtime::Create(const VulkanDevice* device) {
+  if (REXCVAR_GET(reshade_preset).empty()) return nullptr;
   if (device->properties().apiVersion < VK_MAKE_API_VERSION(0, 1, 1, 0)) {
     REXLOG_WARN("ReShade: needs Vulkan 1.1; effects are off");
     return nullptr;

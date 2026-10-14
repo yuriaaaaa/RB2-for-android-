@@ -1740,9 +1740,19 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   // reshade_output_, which is then painted instead (scaling, letterbox and the
   // presenter's own effects apply to it as usual).
   if (guest_output_image) {
+    // Only this thread paints, so one switch for the process is enough.
+    static reshade::LiveSwitch live_switch;
+    bool live_enabled = false;
     if (!reshade_checked_) {
       reshade_checked_ = true;
+      live_switch.Poll(&live_enabled);
       reshade_.reset(reshade::Runtime::CreateIfEnabled(vulkan_device_).release());
+    } else if (live_switch.Poll(&live_enabled)) {
+      // Turned on/off or effects changed from the in-game menu: rebuild with the GPU idle.
+      paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
+      reshade_.reset();
+      reshade_output_.reset();
+      if (live_enabled) reshade_.reset(reshade::Runtime::Create(vulkan_device_).release());
     }
     if (reshade_) {
       const VkExtent2D extent = guest_output_image->extent();

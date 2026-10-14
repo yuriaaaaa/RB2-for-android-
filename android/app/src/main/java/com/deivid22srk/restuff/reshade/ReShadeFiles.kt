@@ -37,6 +37,11 @@ object ReShadeFiles {
     /** Present while a game run with ReShade hasn't yet got through its first frames. */
     fun startMarker(root: File): File = File(root, ".starting")
 
+    /** The in-game switch the engine polls while the game runs ("1" on, "0" off). */
+    fun setLive(root: File, on: Boolean) {
+        File(root, ".live").writeText(if (on) "1" else "0")
+    }
+
     fun ensure(root: File): Boolean {
         File(root, "Shaders").mkdirs()
         File(root, "Textures").mkdirs()

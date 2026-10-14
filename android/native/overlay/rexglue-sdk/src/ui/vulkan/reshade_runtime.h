@@ -17,10 +17,25 @@
 
 namespace rex::ui::vulkan::reshade {
 
+// The launcher's in-game switch: it writes "1" or "0" to <reshade_path>/.live and
+// edits the preset while the game runs. Poll() checks both about twice a second.
+class LiveSwitch {
+ public:
+  // True when ReShade must be rebuilt; `enabled` then holds the wanted state.
+  bool Poll(bool* enabled);
+
+ private:
+  uint32_t calls_ = 0;
+  bool started_ = false;
+  std::filesystem::file_time_type live_time_{}, preset_time_{};
+};
+
 class Runtime {
  public:
   // Null when ReShade is off (cvar reshade_enabled) or the device can't run it.
   static std::unique_ptr<Runtime> CreateIfEnabled(const VulkanDevice* device);
+  // Same, ignoring reshade_enabled (the in-game switch turned it on).
+  static std::unique_ptr<Runtime> Create(const VulkanDevice* device);
   ~Runtime();
 
   // Records the effects for the frame in `src` (kept in SHADER_READ_ONLY_OPTIMAL) and

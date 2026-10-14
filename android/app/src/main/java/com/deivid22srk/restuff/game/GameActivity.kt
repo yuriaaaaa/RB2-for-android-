@@ -217,28 +217,37 @@ class GameActivity : SDLActivity() {
             }
         }
         // ---- ReShade (0.4.0): effects from Internal storage/Raging Blast 2/reshade ----
-        var reshadeDir = if (settings.reshadeEnabled && publicLogDir != null) ReShadeFiles.folder() else null
+        // The folder and preset are always passed so the in-game menu can turn
+        // ReShade on later (it writes .live and the preset; the engine polls them).
+        val reshadeRoot = if (publicLogDir != null) ReShadeFiles.folder() else null
+        var reshadeOn = settings.reshadeEnabled && reshadeRoot != null
         // Freeze guard: the engine deletes .starting once ReShade has run 120 frames.
         // If it's still there, the last run with ReShade froze or crashed first.
-        if (reshadeDir != null && ReShadeFiles.startMarker(reshadeDir).exists()) {
-            runCatching { PortSettingsRepository(this).save(settings.copy(reshadeEnabled = false)) }
-            runOnUiThread {
-                Toast.makeText(
-                    this,
-                    "ReShade is off: the last run with it froze or crashed. See ReShade.log in Settings.",
-                    Toast.LENGTH_LONG,
-                ).show()
+        if (reshadeRoot != null && ReShadeFiles.startMarker(reshadeRoot).exists()) {
+            if (reshadeOn || settings.reshadeEnabled) {
+                runCatching { PortSettingsRepository(this).save(settings.copy(reshadeEnabled = false)) }
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        "ReShade is off: the last run with it froze or crashed. See ReShade.log in Settings.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
             }
-            reshadeDir = null
+            runCatching { ReShadeFiles.startMarker(reshadeRoot).delete() }
+            reshadeOn = false
         }
-        if (reshadeDir != null && ReShadeFiles.readTechniques(ReShadeFiles.preset(reshadeDir)).isNotEmpty()) {
-            runCatching { ReShadeFiles.startMarker(reshadeDir).writeText("") }
-            cfg["reshade_enabled"] = "true"
-            cfg["reshade_path"] = "\"${reshadeDir.absolutePath}\""
-            cfg["reshade_preset"] = "\"${ReShadeFiles.preset(reshadeDir).absolutePath}\""
-        } else {
-            cfg["reshade_enabled"] = "false"
+        if (reshadeOn && ReShadeFiles.readTechniques(ReShadeFiles.preset(reshadeRoot!!)).isEmpty()) reshadeOn = false
+        if (reshadeRoot != null) {
+            runCatching {
+                ReShadeFiles.ensure(reshadeRoot)
+                ReShadeFiles.setLive(reshadeRoot, reshadeOn)
+                if (reshadeOn) ReShadeFiles.startMarker(reshadeRoot).writeText("")
+            }
+            cfg["reshade_path"] = "\"${reshadeRoot.absolutePath}\""
+            cfg["reshade_preset"] = "\"${ReShadeFiles.preset(reshadeRoot).absolutePath}\""
         }
+        cfg["reshade_enabled"] = if (reshadeOn) "true" else "false"
         // ---- GPU fixes and diagnostics carried over from the WET port ----
         // (the SDK overlays keep their wet_ names). Their default paths point at
         // the WET folder, so point them at this game's folder instead.
@@ -531,6 +540,7 @@ class GameActivity : SDLActivity() {
                 pendingQuickSettings = updated
             },
             onExitRequested = { showExitConfirm() },
+            reshadeRoot = ReShadeFiles.folder().takeIf { it.isDirectory },
         )
         quickDialog = dialog
         dialog.setOnDismissListener {

@@ -19,7 +19,10 @@ import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
 import com.deivid22srk.restuff.settings.FpsLimitOption
+import com.deivid22srk.restuff.reshade.ReShadeFiles
 import com.deivid22srk.restuff.settings.PortSettings
+import java.io.File
+import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 
 /**
@@ -131,9 +134,12 @@ class QuickSettingsDialog(
     initial: PortSettings,
     private val onChange: (PortSettings) -> Unit,
     private val onExitRequested: () -> Unit,
+    /** ReShade folder (null without storage access): the section switches it live. */
+    private val reshadeRoot: File? = null,
 ) : Dialog(context) {
 
     private var current = initial
+    private val io = Executors.newSingleThreadExecutor()
 
     init {
         setCanceledOnTouchOutside(true)
@@ -229,6 +235,8 @@ class QuickSettingsDialog(
             current.showFpsCounter
         ) { checked -> mutate(current.copy(showFpsCounter = checked)) })
 
+        reshadeRoot?.let { addReShadeSection(c, body, it) }
+
         root.addView(ScrollView(c).apply {
             isFillViewport = false
             layoutParams = LinearLayout.LayoutParams(
@@ -285,6 +293,70 @@ class QuickSettingsDialog(
         })
 
         setContentView(root)
+    }
+
+    /**
+     * ReShade, live: the switch writes .live and each effect switch rewrites the
+     * preset's Techniques; the engine notices within half a second and rebuilds
+     * its effects (the game keeps running).
+     */
+    private fun addReShadeSection(c: Context, body: LinearLayout, root: File) {
+        body.addView(sectionLabel(c, "RESHADE"))
+        addRow(body, switchRow(
+            c, "ReShade effects", "Applies in a moment; heavy effects cost frames",
+            current.reshadeEnabled
+        ) { checked ->
+            mutate(current.copy(reshadeEnabled = checked))
+            io.execute {
+                runCatching {
+                    ReShadeFiles.ensure(root)
+                    // Freeze guard (see GameActivity): cleared after 120 good frames.
+                    if (checked) ReShadeFiles.startMarker(root).writeText("")
+                    else ReShadeFiles.startMarker(root).delete()
+                    ReShadeFiles.setLive(root, checked)
+                }
+            }
+        })
+        val effects = LinearLayout(c).apply { orientation = LinearLayout.VERTICAL }
+        val status = TextView(c).apply {
+            text = "Loading effects…"
+            setTextColor(COL_TEXT_DIM)
+            textSize = 12f
+            setPadding(dp(c, 14f), dp(c, 4f), dp(c, 14f), dp(c, 8f))
+        }
+        body.addView(status)
+        body.addView(effects)
+        io.execute {
+            val preset = ReShadeFiles.preset(root)
+            val available = runCatching { ReShadeFiles.scan(root) }.getOrDefault(emptyList())
+            val active = runCatching { ReShadeFiles.readTechniques(preset) }.getOrDefault(emptyList())
+            body.post {
+                if (available.isEmpty()) {
+                    status.text = "No effects yet: get shaders in Settings → ReShade effects."
+                    return@post
+                }
+                status.text = "Effects run in the order they were turned on."
+                val on = active.toMutableList()
+                // Effects that are on come first, in run order.
+                val ordered = available.sortedBy { t ->
+                    val i = on.indexOfFirst { it == t.id || it == t.name }
+                    if (i < 0) Int.MAX_VALUE else i
+                }
+                for (t in ordered) {
+                    addRow(effects, switchRow(c, t.name, t.file, on.any { it == t.id || it == t.name }) { checked ->
+                        on.removeAll { it == t.id || it == t.name }
+                        if (checked) on.add(t.id)
+                        val snapshot = on.toList()
+                        io.execute { runCatching { ReShadeFiles.writeTechniques(preset, snapshot) } }
+                    })
+                }
+            }
+        }
+    }
+
+    override fun dismiss() {
+        super.dismiss()
+        io.shutdown()
     }
 
     // ---- Linhas reutilizáveis ---------------------------------------------

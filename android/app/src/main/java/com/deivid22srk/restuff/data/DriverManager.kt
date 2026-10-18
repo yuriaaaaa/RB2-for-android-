@@ -1,0 +1,608 @@
+package com.deivid22srk.restuff.data
+
+import android.content.Context
+import android.net.Uri
+import android.os.Build
+import org.json.JSONObject
+import java.io.File
+import java.io.IOException
+import java.util.zip.ZipException
+import java.util.zip.ZipInputStream
+
+/**
+ * Gerenciador de drivers gráficos Vulkan no padrão **AdrenoTools** (Turnip).
+ *
+ * Formato suportado (mesmo dos repositórios públicos de drivers, ex.:
+ * K11MCH1/AdrenoToolsDrivers — zips Mesa/Turnip):
+ *
+ * ```
+ * driver.zip
+ *  ├── meta.json                    { "libName", "author", "description",
+ *  │                                  "packageVersion"/"version", "vendor",
+ *  │                                  "gpus", "name" ... }
+ *  └── lib/ARM64-v8A/libvulkan_freedreno.so   (ou o .so na raiz / outro dir)
+ * ```
+ *
+ * O .so localizado é extraído para o armazenamento privado do app
+ * (`files/drivers/<id>/driver.so`) e o driver ativo é persistido em
+ * `files/drivers/active.txt` no formato `lib=<caminho>`. O lado NATIVO
+ * (android_main.cpp) lê esse arquivo antes de qualquer init gráfico e o
+ * loader do SDK (vulkan_instance.cpp) faz dlopen do driver — i.e. o driver
+ * selecionado é usado DE VERDADE para criar instance/device/swapchain.
+ *
+ * Compatibilidade de chaves: aceita `libName` (AdrenoTools) e `libraryName`
+ * (variações da comunidade); `name` e `description` são usados como rótulo.
+ */
+object GpuDriverManager {
+
+    /** Driver importado (metadados + caminho do .so extraído). */
+    data class GpuDriver(
+        val id: String,
+        val libName: String,
+        val name: String,
+        val author: String,
+        val version: String,
+        val vendor: String,
+        val libPath: String,
+    )
+
+    /** Erro de import com mensagem pronta para exibir ao usuário. */
+    class DriverImportException(message: String) : IOException(message)
+
+    // ----------------------------------------------------------------------
+    // Caminhos
+    // ----------------------------------------------------------------------
+
+    fun driversDir(context: Context): File = File(context.filesDir, "drivers")
+
+    private fun driverJson(dir: File): File = File(dir, "driver.json")
+
+    // ----------------------------------------------------------------------
+    // Listagem
+    // ----------------------------------------------------------------------
+
+    /** Lista os drivers importados (metadados válidos), mais recentes primeiro. */
+    fun list(context: Context): List<GpuDriver> {
+        val dir = driversDir(context)
+        if (!dir.isDirectory) return emptyList()
+        return dir.listFiles { f -> f.isDirectory }
+            ?.mapNotNull { sub -> readDriverJson(sub) }
+            ?.sortedByDescending { it.id }
+            ?: emptyList()
+    }
+
+    private fun readDriverJson(dir: File): GpuDriver? = runCatching {
+        val json = driverJson(dir)
+        if (!json.isFile) return null
+        val o = JSONObject(json.readText())
+        GpuDriver(
+            id = dir.name,
+            libName = o.optString("libName"),
+            name = o.optString("name", "").ifEmpty { o.optString("libName") },
+            author = o.optString("author", ""),
+            version = o.optString("version", ""),
+            vendor = o.optString("vendor", ""),
+            libPath = o.getString("libPath"),
+        )
+    }.getOrNull()
+
+    // ----------------------------------------------------------------------
+    // Import (.zip AdrenoTools via SAF)
+    // ----------------------------------------------------------------------
+
+    /**
+     * Importa um driver Turnip (.zip) escolhido via SAF. Valida zip, meta.json
+     * e a biblioteca .so (assinatura ELF + arquitetura arm64 + tipo), extrai
+     * TODOS os .so (companheiros com nomes originais — pacotes adpkg dependem
+     * deles) e persiste metadados. Retorna o driver importado. Lança
+     * [DriverImportException] com mensagem amigável.
+     */
+    fun importFromZip(context: Context, zipUri: Uri): GpuDriver {
+        val dir = driversDir(context).apply { mkdirs() }
+
+        // ---- Passada 1: nomes das entradas + meta.json ------------------
+        val entries = ArrayList<String>()
+        var metaJson: String? = null
+        try {
+            context.contentResolver.openInputStream(zipUri)?.use { input ->
+                ZipInputStream(input.buffered(DEFAULT_BUFFER)).use { zip ->
+                    while (true) {
+                        val e = zip.nextEntry ?: break
+                        val name = e.name ?: ""
+                        if (!e.isDirectory) {
+                            if (isMetaJson(name) && metaJson == null) {
+                                metaJson = zip.readBytes().toString(Charsets.UTF_8)
+                            } else {
+                                entries.add(name)
+                            }
+                        }
+                        zip.closeEntry()
+                    }
+                }
+            } ?: throw DriverImportException("Couldn't open the selected file.")
+        } catch (e: DriverImportException) {
+            throw e
+        } catch (e: ZipException) {
+            throw DriverImportException("The .zip file is invalid or corrupted.")
+        } catch (e: IOException) {
+            // [evidência] review 17-e1 #2: e.message de FileNotFoundException
+            // leva o caminho/URI cru do arquivo — mensagem curada, sem path.
+            throw DriverImportException(
+                "Couldn't read the selected .zip — try selecting it again."
+            )
+        }
+
+        if (entries.isEmpty() && metaJson == null) {
+            throw DriverImportException("The .zip is empty.")
+        }
+
+        // ---- Valida meta.json (padrão AdrenoTools) ----------------------
+        if (metaJson == null) {
+            throw DriverImportException(
+                "meta.json not found in the .zip — this isn't an AdrenoTools driver."
+            )
+        }
+        val meta = try {
+            JSONObject(metaJson!!)
+        } catch (e: Exception) {
+            throw DriverImportException("The driver's meta.json is invalid (corrupted JSON).")
+        }
+
+        val libName = (meta.optString("libName", "")
+            .ifEmpty { meta.optString("libraryName", "") }).trim()
+        val displayName = meta.optString("name", "")
+            .ifEmpty { meta.optString("description", "") }
+            .ifEmpty { "Driver Turnip" }
+        val author = meta.optString("author", "").ifEmpty { "desconhecido" }
+        val version = meta.optString("packageVersion", "")
+            .ifEmpty { meta.optString("version", "") }.ifEmpty { "?" }
+        val vendor = meta.optString("vendor", "")
+
+        // [evidência] minApi dos meta.json reais (K11MCH1 26.0.0 = 27;
+        // adpkg 849 = 35): respeitar evita importar driver que o adrenotools
+        // não consegue carregar no aparelho.
+        val minApi = meta.optInt("minAPI", meta.optInt("minApi", 0))
+        if (minApi > 0 && minApi > Build.VERSION.SDK_INT) {
+            throw DriverImportException(
+                "This driver needs Android API $minApi (minAPI in meta.json); this " +
+                    "phone is on API ${Build.VERSION.SDK_INT}."
+            )
+        }
+
+        // ---- Localiza a biblioteca .so do driver ------------------------
+        // Caminhos reais variam: raiz do zip, lib/ARM64-v8A/, arm64-v8a/ etc.
+        // Prioridade: basename == libName (case-insensitive) → .so com
+        // "vulkan"/"turnip"/"freedreno" no nome → primeiro .so.
+        val soEntries = entries.filter { it.endsWith(".so", ignoreCase = true) }
+        if (soEntries.isEmpty()) {
+            throw DriverImportException(
+                "No .so library found in the .zip — the driver is incomplete."
+            )
+        }
+        val target = libName.takeIf { it.isNotEmpty() }
+            ?.let { ln -> soEntries.firstOrNull { it.substringAfterLast('/').equals(ln, true) } }
+            ?: soEntries.firstOrNull {
+                val n = it.lowercase()
+                n.contains("vulkan") || n.contains("turnip") || n.contains("freedreno")
+            }
+            ?: soEntries.first()
+        if (libName.isNotEmpty() &&
+            !target.substringAfterLast('/').equals(libName, true)
+        ) {
+            throw DriverImportException(
+                "The driver library ('$libName') wasn't found in the .zip."
+            )
+        }
+
+        // ---- Passada 2: extrai TODOS os .so (nomes ORIGINAIS) ------------
+        // O carregador real (libadrenotools) abre o driver pelo NOME no
+        // diretório dele num namespace próprio — e pacotes multi-arquivo
+        // (adpkg) têm companheiros (libgsl.so, libadreno_utils.so, not*.so)
+        // resolvidos por DT_NEEDED no MESMO diretório. Renomear tudo para
+        // "driver.so" quebrava o adpkg e dispensava os companheiros.
+        // A biblioteca principal mantém o basename do zip (alvo da seleção
+        // acima) e recebe validação completa de ELF/arm64/ET_DYN.
+        val id = newDriverId(displayName, version)
+        val destDir = File(dir, id).apply { mkdirs() }
+        val destSo = File(destDir, target.substringAfterLast('/'))
+        try {
+            context.contentResolver.openInputStream(zipUri)?.use { input ->
+                ZipInputStream(input.buffered(DEFAULT_BUFFER)).use { zip ->
+                    while (true) {
+                        val e = zip.nextEntry ?: break
+                        if (!e.isDirectory && e.name.endsWith(".so", ignoreCase = true)) {
+                            val dest = File(destDir, e.name.substringAfterLast('/'))
+                            if (dest.name == destSo.name) {
+                                copySoValidating(zip, dest, validateArch = true)
+                            } else {
+                                copySoValidating(zip, dest, validateArch = false)
+                            }
+                        }
+                        zip.closeEntry()
+                    }
+                }
+            } ?: throw IOException("The file picker closed the stream")
+            if (!destSo.isFile) {
+                throw DriverImportException(
+                    "The main library ('$target') wasn't extracted — incomplete zip."
+                )
+            }
+        } catch (e: Exception) {
+            destDir.deleteRecursively()
+            if (e is DriverImportException) throw e
+            // [evidência] review 17-e1 #2: idem — sem e.message na UI.
+            throw DriverImportException(
+                "Couldn't extract the driver — check free space and try again."
+            )
+        }
+
+        // ---- Persiste metadados ----------------------------------------
+        val driver = GpuDriver(
+            id = id,
+            libName = libName.ifEmpty { target.substringAfterLast('/') },
+            name = displayName,
+            author = author,
+            version = version,
+            vendor = vendor,
+            libPath = destSo.absolutePath,
+        )
+        try {
+            driverJson(destDir).writeText(
+                JSONObject()
+                    .put("libName", driver.libName)
+                    .put("name", driver.name)
+                    .put("author", driver.author)
+                    .put("version", driver.version)
+                    .put("vendor", driver.vendor)
+                    .put("libPath", driver.libPath)
+                    .put("source", zipUri.toString())
+                    .toString(2)
+            )
+        } catch (e: IOException) {
+            destDir.deleteRecursively()
+            throw DriverImportException("Couldn't save the driver's details.")
+        }
+        return driver
+    }
+
+    /**
+     * Copia um .so do zip validando: magic ELF (0x7F 'E' 'L' 'F') sempre;
+     * quando [validateArch], também classe ELF64, máquina EM_AARCH64 (183) e
+     * tipo ET_DYN (3) — drivers x86_64 ou objetos relocáveis eram aceitos
+     * antes e falhavam só no boot, sem mensagem útil.
+     */
+    private fun copySoValidating(zip: ZipInputStream, dest: File, validateArch: Boolean) {
+        dest.outputStream().use { out ->
+            val header = ByteArray(20)
+            var read = 0
+            while (read < 20) {
+                val n = zip.read(header, read, 20 - read)
+                if (n < 0) throw DriverImportException("The driver library is truncated.")
+                read += n
+            }
+            if (!(header[0] == 0x7F.toByte() && header[1] == 'E'.code.toByte() &&
+                    header[2] == 'L'.code.toByte() && header[3] == 'F'.code.toByte())
+            ) {
+                throw DriverImportException(
+                    "The library in the .zip isn't a valid ELF binary (incompatible driver)."
+                )
+            }
+            if (validateArch) {
+                val eiClass = header[4].toInt() and 0xFF            // 2 = ELF64
+                val eType = ((header[17].toInt() and 0xFF) shl 8) or (header[16].toInt() and 0xFF)
+                val eMachine = ((header[19].toInt() and 0xFF) shl 8) or (header[18].toInt() and 0xFF)
+                if (eiClass != 2 || eMachine != 183 || eType != 3) {
+                    throw DriverImportException(
+                        "The main library isn't a shared arm64-v8a ELF " +
+                            "(class=$eiClass machine=$eMachine type=$eType) — incompatible driver."
+                    )
+                }
+            }
+            out.write(header)
+            zip.copyTo(out, DEFAULT_BUFFER)
+        }
+    }
+
+    private fun isMetaJson(name: String): Boolean {
+        val lower = name.lowercase()
+        return lower == "meta.json" || lower.endsWith("/meta.json")
+    }
+
+    private fun newDriverId(name: String, version: String): String {
+        val stamp = System.currentTimeMillis().toString(36)
+        val slug = name.lowercase().filter { it.isLetterOrDigit() }.take(16).ifEmpty { "driver" }
+        return "${slug}_${version.filter { it.isLetterOrDigit() || it == '.' }}_$stamp"
+    }
+
+    // ----------------------------------------------------------------------
+    // Seleção do driver ativo
+    // ----------------------------------------------------------------------
+
+    /** Define o driver ativo (o nativo fará dlopen dele no próximo boot). */
+    fun setActive(context: Context, id: String) {
+        val driver = readDriverJson(File(driversDir(context), id))
+            ?: throw DriverImportException("Driver not found.")
+        // [evidência] seleção SEM validação aceitava .so apagado/corrompido
+        // (commit 3a8c08c) — confere existência + magic ELF antes de ativar.
+        val so = File(driver.libPath)
+        if (!so.isFile) {
+            throw DriverImportException(
+                "The driver file is missing (${so.name}) — import it again."
+            )
+        }
+        readElfMagicOrThrow(
+            so,
+            "The driver file isn't a valid ELF — import it again."
+        )
+        // [evidência] mesmo bug do setActiveVortek: sem mkdirs(), o writeText
+        // lançava FileNotFoundException (ENOENT) em <files>/drivers/active.txt
+        // quando nenhum driver havia sido importado ainda.
+        writeActiveFile(context, "id=$id\nlib=${driver.libPath}\n")
+    }
+
+    // [evidência] TOCTOU do review 17-e1: so.isFile pode passar e o arquivo
+    // sumir antes do open (limpeza de storage) — IOException crua levava
+    // caminho absoluto para a UI. Leitura do magic centralizada e curada.
+    private fun readElfMagicOrThrow(so: File, invalidElfMessage: String) {
+        try {
+            so.inputStream().use { input ->
+                val magic = ByteArray(4)
+                if (input.read(magic) < 4 ||
+                    !(magic[0] == 0x7F.toByte() && magic[1] == 'E'.code.toByte() &&
+                        magic[2] == 'L'.code.toByte() && magic[3] == 'F'.code.toByte())
+                ) {
+                    throw DriverImportException(invalidElfMessage)
+                }
+            }
+        } catch (e: DriverImportException) {
+            throw e
+        } catch (e: IOException) {
+            throw DriverImportException(
+                "Couldn't read the driver file — import it again."
+            )
+        }
+    }
+
+    /** Volta para o driver Vulkan do sistema (remove active.txt). */
+    fun clearActive(context: Context) {
+        ActiveFileStore.clear(driversDir(context))
+    }
+
+    /** id do driver ativo, ou null se usando o driver do sistema. */
+    fun activeId(context: Context): String? = ActiveFileStore.readId(driversDir(context))
+
+    /** Remove um driver importado (e desativa, se era o ativo). */
+    fun remove(context: Context, id: String) {
+        if (activeId(context) == id) clearActive(context)
+        File(driversDir(context), id).deleteRecursively()
+    }
+
+    // ------------------------------------------------------------------
+    // Vortek — camada de compatibilidade Vulkan embutida no APK
+    // (brunodev85/Winlator, LGPL-2.1). Não é um driver de GPU: o cliente
+    // (libvulkan_vortek.so) intercepta as chamadas Vulkan do motor e o
+    // servidor (libvortekrenderer.so) as executa no driver do SISTEMA com
+    // fixups de compatibilidade — pensado para GPUs não-Adreno (Mali etc.).
+    // ------------------------------------------------------------------
+
+    /** id sintático da opção Vortek no active.txt. */
+    const val VORTEK_DRIVER_ID = "vortek"
+
+    /** Caminho do cliente Vortek dentro do APK (nativeLibraryDir). */
+    fun vortekClientPath(context: Context): File =
+        File(context.applicationInfo.nativeLibraryDir, "libvulkan_vortek.so")
+
+    /** O cliente Vortek está embutido neste build? */
+    fun isVortekAvailable(context: Context): Boolean =
+        vortekClientPath(context).isFile
+
+    /**
+     * Ativa a camada Vortek: o active.txt aponta para o cliente embutido no
+     * APK e o android_main.cpp sobe o servidor antes do init gráfico. Se o
+     * servidor não responder, o motor cai no driver do sistema (preflight do
+     * vulkan_instance.cpp — motivo no Diagnóstico).
+     */
+    fun setActiveVortek(context: Context) {
+        val so = vortekClientPath(context)
+        if (!so.isFile) {
+            throw DriverImportException(
+                "Vortek client not found in the APK (${so.name}) — this " +
+                    "build doesn't include the compatibility layer."
+            )
+        }
+        readElfMagicOrThrow(
+            so,
+            "Invalid Vortek client (not an ELF) — reinstall the app."
+        )
+        // [evidência] fix do ENOENT reportado ao selecionar Vortek: a camada
+        // é embutida no APK (não passa pelo importFromZip, que é quem cria
+        // <files>/drivers/), então em instalação limpa o diretório não
+        // existia e activeFile().writeText() falhava com
+        // "/data/user/0/.../files/drivers/active.txt: open failed: ENOENT".
+        writeActiveFile(
+            context,
+            "id=$VORTEK_DRIVER_ID\nlib=${so.absolutePath}\n"
+        )
+    }
+
+    /**
+     * Persiste o active.txt garantindo o diretório <files>/drivers, com
+     * escrita ATÔMICA (tmp + rename no mesmo diretório: um boot concorrente
+     * do jogo nunca lê o arquivo truncado — review 17-e1 #6) e convertendo
+     * falhas de E/S em [DriverImportException] com mensagem amigável —
+     * sem vazar caminho/exceção crua para a UI (review 17-e1 #2).
+     */
+    private fun writeActiveFile(context: Context, content: String) {
+        val dir = driversDir(context)
+        if (!dir.isDirectory && !dir.mkdirs()) {
+            throw DriverImportException(
+                "Couldn't create the drivers folder (${dir.name}) — " +
+                    "check free space and try again."
+            )
+        }
+        try {
+            ActiveFileStore.write(dir, content)
+        } catch (e: IOException) {
+            throw DriverImportException(
+                "Couldn't save the driver choice — check free " +
+                    "space and try again."
+            )
+        }
+    }
+
+    /**
+     * Self-heal do active.txt quando o driver ativo é o Vortek (review
+     * 17-e1 #1): o cliente vive em nativeLibraryDir, que MUDA a cada
+     * atualização do app (Android 8+: /data/app/~~<random>/...), e o
+     * active.txt sobrevive à atualização — sem isto, após atualizar o app
+     * o jogo abriria no driver do sistema com o Vortek ainda "selecionado"
+     * nas Configurações (desync silencioso).
+     *
+     * Chamar ao entrar nas Configurações e ANTES de iniciar o jogo
+     * (GameActivity.getArguments). Retorna true se regravou o arquivo.
+     */
+    fun reconcileActiveVortek(context: Context): Boolean = ActiveFileStore.reconcile(
+        driversDir(context),
+        vortekClientPath(context),
+        VORTEK_DRIVER_ID,
+    )
+
+    // ----------------------------------------------------------------------
+    // Diagnóstico do último boot (escrito por vulkan_instance.cpp)
+    // ----------------------------------------------------------------------
+
+    /** Desfecho do carregamento do driver no último boot do jogo. */
+    data class DriverBootOutcome(
+        val status: String,   // custom_ok | custom_failed | system
+        val driver: String,
+        val error: String,
+    )
+
+    /**
+     * Lê files/drivers/last_boot.txt (formato chave=valor). null se o jogo
+     * ainda não bootou desde a instalação.
+     */
+    fun lastBootOutcome(context: Context): DriverBootOutcome? {
+        val f = File(driversDir(context), "last_boot.txt")
+        if (!f.isFile) return null
+        return runCatching {
+            val map = f.readLines()
+                .mapNotNull { line ->
+                    val idx = line.indexOf('=')
+                    if (idx > 0) line.substring(0, idx) to line.substring(idx + 1) else null
+                }
+                .toMap()
+            DriverBootOutcome(
+                status = map["status"] ?: "?",
+                driver = map["driver"] ?: "-",
+                error = map["error"] ?: "-",
+            )
+        }.getOrNull()
+    }
+
+    /**
+     * Local do log da última sessão (escrito por GameActivity):
+     * "publico:<caminho>" ou "privado".
+     */
+    fun lastLogLocation(context: Context): String? =
+        File(context.filesDir, "last_log_location.txt").takeIf { it.isFile }?.readText()
+
+    private const val DEFAULT_BUFFER = 1 shl 16 // 64 KiB
+}
+
+// ----------------------------------------------------------------------
+// Núcleo de persistência do active.txt SEM android.Context — só java.io.File
+// (JVM puro) → testável em unidade SEM Robolectric
+// (app/src/test/java/.../ActiveFileStoreTest.kt, roda no CI antes do build
+// nativo de ~45min). A superfície pública do GpuDriverManager delega aqui.
+// ----------------------------------------------------------------------
+
+/**
+ * Leitura/escrita do arquivo de driver ativo (<files>/drivers/active.txt),
+ * formato `id=<id>\nlib=<caminho absoluto>`.
+ *
+ * Escreve com mkdirs do diretório (fix do ENOENT reportado ao selecionar
+ * Vortek em instalação limpa) + escrita atômica (tmp + rename no mesmo
+ * diretório) + trava de processo (UI e getArguments do jogo podem
+ * concorrer). Leitura tolerante a CRLF, espaços e ordem invertida das
+ * linhas.
+ */
+internal object ActiveFileStore {
+
+    /** Serializa escritas concorrentes (UI + boot do jogo). */
+    private val writeLock = Any()
+
+    fun activeFile(driversDir: File): File = File(driversDir, "active.txt")
+
+    /** id= do active.txt, ou null se arquivo/linha ausentes. */
+    fun readId(driversDir: File): String? = readKey(activeFile(driversDir), "id")
+
+    /** lib= do active.txt, ou null se arquivo/linha ausentes. */
+    fun readLib(driversDir: File): String? = readKey(activeFile(driversDir), "lib")
+
+    private fun readKey(f: File, key: String): String? {
+        if (!f.isFile) return null
+        return f.useLines { lines ->
+            lines.map { it.trim() }
+                .firstOrNull { it.startsWith("$key=") }
+                ?.substringAfter('=')
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+        }
+    }
+
+    /**
+     * Persiste o active.txt: cria o diretório se necessário (fix ENOENT),
+     * escreve em tmp e renomeia (atômico no mesmo diretório — leitor
+     * concorrente nunca vê truncado); se o rename falhar, escrita direta
+     * mantém o fluxo vivo. [IOException] sobe para o chamador traduzir.
+     */
+    fun write(driversDir: File, content: String) {
+        if (!driversDir.isDirectory && !driversDir.mkdirs()) {
+            throw IOException("mkdirs failed: ${driversDir.name}")
+        }
+        val target = activeFile(driversDir)
+        val tmp = File(driversDir, "active.txt.tmp")
+        synchronized(writeLock) {
+            try {
+                tmp.writeText(content)
+                if (!tmp.renameTo(target)) {
+                    // rename no mesmo diretório é atômico em Linux/Android;
+                    // retorno false (não lança) → fallback da escrita direta.
+                    target.writeText(content)
+                    // [17-e3] não deixa o tmp órfão no fallback.
+                    tmp.delete()
+                }
+            } catch (e: IOException) {
+                tmp.delete()
+                throw e
+            }
+        }
+    }
+
+    /** Remove o active.txt (idempotente — arquivo ausente é no-op). */
+    fun clear(driversDir: File) {
+        synchronized(writeLock) { activeFile(driversDir).delete() }
+    }
+
+    /**
+     * Self-heal Vortek: regrava o active.txt quando id=vortek e o caminho
+     * do cliente difere do esperado (app atualizado — nativeLibraryDir muda
+     * a cada reinstalação) OU está ausente (resíduo de escrita truncada
+     * pré-fix / edição manual — review 17-e2). Não mexe em driver Turnip,
+     * build sem Vortek ou arquivo ausente. Retorna true se regravou.
+     */
+    fun reconcile(driversDir: File, expectedClient: File, vortekId: String): Boolean {
+        // Build sem a camada Vortek: nada a reconciliar — o nativo já cai no
+        // driver do sistema e o motivo aparece no Diagnóstico.
+        if (!expectedClient.isFile) return false
+        val id = readId(driversDir) ?: return false
+        if (id != vortekId) return false
+        val lib = readLib(driversDir)
+        if (lib == expectedClient.absolutePath) return false
+        return runCatching {
+            write(driversDir, "id=$vortekId\nlib=${expectedClient.absolutePath}\n")
+            true
+        }.getOrDefault(false)
+    }
+}

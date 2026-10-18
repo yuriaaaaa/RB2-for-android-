@@ -1,0 +1,781 @@
+package com.deivid22srk.restuff.mods
+
+import java.io.File
+import java.io.IOException
+import java.io.InputStream
+import java.util.zip.ZipInputStream
+
+/**
+ * Installs zip mods straight into the game folder.
+ *
+ * A zip file is matched to the game in one of two ways:
+ *  - FILE: its path ends with the path of a file in the game folder
+ *    (`data/X360/st_pack_sound_pt_x360.afs`, `movie/xyz.wmv`, ...). The game
+ *    file is replaced.
+ *  - AFS: it stands for an entry inside one of the game's AFS archives. The
+ *    Xbox 360 packs have no entry names, so [PackIndex] turns the mod's name
+ *    (`067_brolly_0_2p_i.zpak`) into the path the game asks for
+ *    (`battle/character/model/chara_067_2p_model_i.pak`) and finds its slot.
+ *    That entry is replaced inside the archive.
+ *
+ * Before a game file is changed for the first time, the original is kept next
+ * to it as `<name>.bk`. A `.bk` is never overwritten, so it always holds the
+ * file as it was before any mod. Uninstalling the last mod that touches a file
+ * puts the `.bk` back; uninstalling one of several rebuilds the file from the
+ * `.bk` plus the mods still installed, which is why each mod's files are kept
+ * in [modsDir].
+ *
+ * Pure java.io so it runs in JVM unit tests.
+ */
+class ModManager(
+    private val gameRoot: File,
+    private val modsDir: File,
+    private val savesDir: File? = null,
+    private val packIndexFile: File? = null,
+    /** Unpacks a .rar/.7z (or any archive) into a folder; null where only zips are supported. */
+    private val unpacker: ((archive: File, into: File) -> Unit)? = null,
+) {
+
+    enum class Kind { FILE, AFS, SAVE }
+
+    /** One change a mod makes: [target] is relative to the game folder (the saves folder for SAVE). */
+    data class Change(val kind: Kind, val target: String, val entry: String?, val stored: String)
+
+    data class Skipped(val path: String, val reason: String)
+
+    /** One file (`_i`, `_s` or `_v`) of a PS3/PC character, and the pack slot it replaces. */
+    private data class Ps3Part(val path: String, val slot: Pair<String, Int>) {
+        private val file = PackIndex.characterFile(path.substringAfterLast('/'))
+        /** i, m (the .spr pack) or v. */
+        val part = file?.part ?: '?'
+        val character = file?.stem ?: path.substringAfterLast('/')
+        val stem = path.substringBeforeLast('/', "") + "/" + character
+    }
+
+    data class InstalledMod(
+        val id: String,
+        val name: String,
+        val changes: List<Change>,
+        val skipped: List<Skipped>,
+        /** Warnings for the person installing; not kept in the records. */
+        val notes: List<String> = emptyList(),
+    )
+
+    class ModException(message: String) : IOException(message)
+
+    private val recordFile get() = File(modsDir, "installed.txt")
+
+    fun list(): List<InstalledMod> = readRecords()
+
+    /** Every `.bk` the mods have made, relative to the game folder. */
+    fun backups(): List<String> = gameRoot.walkTopDown()
+        .onEnter { it != modsDir }
+        .filter { it.isFile && it.name.endsWith(BACKUP_SUFFIX) }
+        .map { it.relativeTo(gameRoot).invariantSeparatorsPath }
+        .toList()
+
+    /**
+     * Installs the zip in [zip]. [progress] gets short status lines for the UI.
+     */
+    fun install(zip: InputStream, displayName: String, progress: (String) -> Unit = {}): InstalledMod =
+        install(displayName, { _, _ -> 0 }, progress) { staging -> extractZip(zip, staging) }
+
+    /**
+     * Installs [archive] (.zip, or .rar/.7z when there is an [unpacker]). When it holds
+     * several versions of the same character, [choose] gets the character and the versions'
+     * folder names and returns the index to install; it may block (it runs off the UI thread).
+     */
+    fun install(
+        archive: File,
+        displayName: String,
+        choose: (character: String, versions: List<String>) -> Int = { _, _ -> 0 },
+        progress: (String) -> Unit = {},
+    ): InstalledMod {
+        val magic = ByteArray(2)
+        archive.inputStream().use { it.read(magic) }
+        val isZip = magic[0] == 'P'.code.toByte() && magic[1] == 'K'.code.toByte()
+        return install(displayName, choose, progress) { staging ->
+            if (isZip) {
+                archive.inputStream().use { extractZip(it, staging) }
+            } else {
+                val unpack = unpacker ?: throw ModException("Only .zip mods can be installed here.")
+                staging.mkdirs()
+                try {
+                    unpack(archive, staging)
+                } catch (e: IOException) {
+                    throw ModException("Couldn't unpack $displayName: ${e.message}")
+                }
+                staging.walkTopDown().filter { it.isFile }.map { it.relativeTo(staging).invariantSeparatorsPath }
+                    .sorted().toList()
+            }
+        }
+    }
+
+    private fun install(
+        displayName: String,
+        choose: (String, List<String>) -> Int,
+        progress: (String) -> Unit,
+        extract: (File) -> List<String>,
+    ): InstalledMod {
+        modsDir.mkdirs()
+        repair()
+        // Installing the same zip again replaces the earlier install of it.
+        readRecords().filter { it.name == displayName }.forEach { uninstall(it.id, progress) }
+        val records = readRecords()
+        val id = uniqueId(displayName, records)
+        val staging = File(modsDir, ".staging-$id")
+        staging.deleteRecursively()
+        try {
+            progress("Unpacking $displayName…")
+            val unpacked = extract(staging)
+            if (unpacked.isEmpty()) throw ModException("The archive is empty.")
+            val extracted = nameByContents(staging, unpacked)
+
+            progress("Matching files to the game…")
+            val gameIndex = indexGameFiles()
+            val packs = readPacks(gameIndex.values)
+            val afsIndex = indexAfsEntries(packs)
+            val packIndex = packIndexFile?.let { PackIndex.read(it) }
+            val saves = findSaves()
+            val changes = mutableListOf<Change>()
+            val skipped = mutableListOf<Skipped>()
+            val ps3Parts = mutableListOf<Ps3Part>()
+            val ps3Slots = mutableListOf<Pair<String, Int>>()
+            var saveTaken = false
+            for (path in extracted) {
+                val match = matchFile(path, gameIndex)
+                when {
+                    isJunk(path) -> skipped += Skipped(path, "not a game file")
+                    isSave(path) -> when {
+                        saveTaken -> skipped += Skipped(path, "another copy of the save")
+                        saves.isEmpty() -> skipped += Skipped(
+                            path, "no save to replace yet: play until the game saves once, then install again"
+                        )
+                        else -> {
+                            saves.forEach { changes += Change(Kind.SAVE, it, null, path) }
+                            saveTaken = true
+                        }
+                    }
+                    match != null -> changes += Change(Kind.FILE, match, null, path)
+                    else -> {
+                        val name = path.substringAfterLast('/')
+                        val hits = afsIndex[name.lowercase()]
+                        val slot = if (hits == null) locateSlot(path, packIndex, packs) else null
+                        when {
+                            hits != null -> hits.forEach { (archive, entryName) ->
+                                changes += Change(Kind.AFS, archive, entryName, path)
+                            }
+                            // PS3/PC character packs are converted below, once all three
+                            // parts of the character are known.
+                            slot != null && looksPs3(File(staging, path)) -> ps3Parts += Ps3Part(path, slot)
+                            slot != null -> changes += Change(Kind.AFS, slot.first, "#${slot.second}", path)
+                            name.contains("_ps3", ignoreCase = true) ->
+                                skipped += Skipped(path, "PS3 file; this port uses the Xbox 360 data")
+                            name.endsWith(".zpak", ignoreCase = true) && packIndex == null ->
+                                skipped += Skipped(path, NO_INDEX)
+                            else -> skipped += Skipped(path, UNMATCHED)
+                        }
+                    }
+                }
+            }
+            var converted = 0
+            val characters = ps3Parts.groupBy { it.stem }.toMutableMap()
+            // Mods often ship several versions of one character (Base, SSJ, ...) for the same
+            // slot; only one can be in the game, so the person picks it.
+            characters.entries.filter { (_, parts) -> parts.size == 3 && parts.map { it.part }.toSet().size == 3 }
+                .groupBy { (_, parts) -> parts.map { it.slot }.toSet() }
+                .values.filter { it.size > 1 }
+                .forEach { versions ->
+                    val sorted = versions.sortedBy { it.key }
+                    val labels = versionLabels(sorted.map { it.key })
+                    val name = sorted.first().value.first().character
+                    val pick = choose(name, labels).coerceIn(sorted.indices)
+                    sorted.forEachIndexed { k, (stem, parts) ->
+                        if (k == pick) return@forEachIndexed
+                        characters.remove(stem)
+                        parts.forEach {
+                            skipped += Skipped(it.path, "another version of this character (“${labels[pick]}” was installed)")
+                        }
+                    }
+                }
+            for ((stem, parts) in characters) {
+                val i = parts.firstOrNull { it.part == 'i' }
+                val s = parts.firstOrNull { it.part == 'm' }
+                val v = parts.firstOrNull { it.part == 'v' }
+                val why = if (i == null || s == null || v == null || parts.size != 3) {
+                    "PS3/PC character without all three of its files (_i, _s and _v, or .ioram, .spr " +
+                        "and .vram); it can't be converted"
+                } else {
+                    progress("Converting ${stem.substringAfterLast('/')} to the Xbox 360 format…")
+                    runCatching {
+                        val c = Ps3Converter.convert(
+                            File(staging, i.path).readBytes(), File(staging, s.path).readBytes(),
+                            File(staging, v.path).readBytes(),
+                            originalModel = originalEntry(s.slot),
+                            names = Triple(i.path, s.path, v.path).let { (a, b, c) ->
+                                Triple(a.substringAfterLast('/'), b.substringAfterLast('/'), c.substringAfterLast('/'))
+                            },
+                        )
+                        File(staging, i.path).writeBytes(c.ioram)
+                        File(staging, s.path).writeBytes(c.model)
+                        File(staging, v.path).writeBytes(c.vram)
+                    }.exceptionOrNull()?.let { "PS3/PC character that couldn't be converted: ${it.message}" }
+                }
+                if (why == null) {
+                    parts.forEach { changes += Change(Kind.AFS, it.slot.first, "#${it.slot.second}", it.path) }
+                    converted++
+                } else {
+                    parts.forEach { skipped += Skipped(it.path, why); ps3Slots += it.slot }
+                }
+            }
+            exportOriginals(ps3Slots)
+            if (changes.isEmpty() && ps3Slots.isNotEmpty()) {
+                throw ModException(
+                    "This mod's character files are PS3/PC versions that couldn't be converted, so nothing " +
+                        "was installed.\n" + skipped.filter { it.reason.startsWith("PS3/PC") }.take(6)
+                        .joinToString("\n") { "• ${it.path}: ${it.reason}" }
+                )
+            }
+            if (changes.isEmpty() && skipped.any { it.reason == NO_INDEX }) {
+                throw ModException(
+                    "Start the game once (to the title screen is enough), then install this mod again. " +
+                        "The game tells the launcher where its character files live when it starts."
+                )
+            }
+            if (changes.isEmpty()) {
+                val report = writePackReport(packs)
+                val why = skipped.take(6).joinToString("\n") { "• ${it.path}: ${it.reason}" }
+                throw ModException("Nothing in this mod replaces a game file.\n$why\n$report")
+            }
+
+            checkSpace(changes, staging)
+            val notes = mutableListOf<String>()
+            if (skipped.any { it.reason == NO_INDEX }) {
+                notes += "Character files were skipped: start the game once, then install this mod again for them."
+            }
+            if (converted > 0) {
+                notes += "$converted PS3/PC character${if (converted == 1) " was" else "s were"} converted to the Xbox 360 format."
+            }
+            if (ps3Slots.isNotEmpty()) {
+                notes += "Its ${ps3Slots.size} PS3/PC character files that couldn't be converted were left out."
+            }
+            writeInstallReport(changes, staging)
+
+            val stored = File(modsDir, id)
+            stored.deleteRecursively()
+            if (!staging.renameTo(stored)) throw ModException("Couldn't store the mod's files.")
+
+            val mod = InstalledMod(id, displayName, changes, skipped, notes)
+            val touched = mutableListOf<String>()
+            try {
+                for ((target, targetChanges) in changes.groupBy { it.target }) {
+                    progress("Installing ${target.substringAfterLast('/')}…")
+                    val kind = targetChanges.first().kind
+                    val hadBackup = File(File(baseFor(kind), target).path + BACKUP_SUFFIX).exists()
+                    ensureBackup(kind, target, kind == Kind.AFS)
+                    touched += target
+                    if (kind == Kind.AFS && hadBackup) {
+                        // Start from the original so the archive's layout is the game's own,
+                        // then lay in every installed mod's entries plus this one's.
+                        rebuild(target, records + mod, kind)
+                    } else {
+                        applyAll(targetChanges.map { it to stored })
+                    }
+                }
+                writeRecords(records + mod)
+            } catch (e: Exception) {
+                // Leave the game as it was before this install.
+                for (target in touched) {
+                    val kind = changes.first { it.target == target }.kind
+                    runCatching { rebuild(target, records, kind) }
+                }
+                stored.deleteRecursively()
+                throw e
+            }
+            return mod
+        } finally {
+            staging.deleteRecursively()
+        }
+    }
+
+    /** Removes mod [id] and gives every file it touched back its earlier state. */
+    fun uninstall(id: String, progress: (String) -> Unit = {}) {
+        val records = readRecords()
+        val mod = records.firstOrNull { it.id == id } ?: return
+        val remaining = records.filter { it.id != id }
+        for (change in mod.changes.distinctBy { it.target }) {
+            progress("Restoring ${change.target.substringAfterLast('/')}…")
+            rebuild(change.target, remaining, change.kind)
+        }
+        writeRecords(remaining)
+        File(modsDir, id).deleteRecursively()
+    }
+
+    /** Puts a target back to its original plus whatever [installed] mods still change in it. */
+    private fun rebuild(target: String, installed: List<InstalledMod>, kind: Kind) {
+        val file = File(baseFor(kind), target)
+        val backup = File(file.path + BACKUP_SUFFIX)
+        val still = installed.flatMap { mod -> mod.changes.filter { it.target == target }.map { mod to it } }
+        if (!backup.exists()) {
+            // The mod added this file; there is no original to go back to. An
+            // archive is always the game's own, so it is never deleted.
+            if (still.isEmpty() && kind != Kind.AFS) file.delete()
+            return
+        }
+        if (still.isEmpty()) {
+            restoreBackup(file, backup)
+            return
+        }
+        copyAtomically(backup, file)
+        applyAll(still.map { (mod, change) -> change to File(modsDir, mod.id) })
+    }
+
+    /** Puts [backup] back as [file]: a rename, or a copy where the storage won't rename. */
+    private fun restoreBackup(file: File, backup: File) {
+        if (file.exists() && !file.delete()) throw ModException("Couldn't remove the modded ${file.name}.")
+        if (backup.renameTo(file)) return
+        copyAtomically(backup, file)
+        backup.delete()
+    }
+
+    /**
+     * Gives back any game file that exists only as its `.bk` and that no
+     * installed mod changes, e.g. after a restore was cut short.
+     */
+    fun repair(): List<String> {
+        val touched = readRecords().flatMap { m -> m.changes.filter { it.kind != Kind.SAVE }.map { it.target } }.toSet()
+        val restored = mutableListOf<String>()
+        for (rel in backups()) {
+            val target = rel.removeSuffix(BACKUP_SUFFIX)
+            val file = File(gameRoot, target)
+            if (file.exists() || target in touched) continue
+            runCatching { restoreBackup(file, File(gameRoot, rel)) }.onSuccess { restored += target }
+        }
+        return restored
+    }
+
+    /** Applies [changes] (each with the folder its file is stored in); an archive's are written in one pass. */
+    private fun applyAll(changes: List<Pair<Change, File>>) {
+        for ((change, storedDir) in changes.filter { it.first.kind != Kind.AFS }) {
+            copyAtomically(File(storedDir, change.stored), File(baseFor(change.kind), change.target))
+        }
+        for ((target, group) in changes.filter { it.first.kind == Kind.AFS }.groupBy { it.first.target }) {
+            val archive = AfsArchive.open(File(baseFor(Kind.AFS), target))
+            val writes = LinkedHashMap<Int, File>()
+            for ((change, storedDir) in group) {
+                val name = change.entry!!
+                val index = if (name.startsWith("#")) {
+                    name.drop(1).toIntOrNull()?.takeIf { it in archive.entries.indices }
+                } else {
+                    archive.find(name)?.index
+                } ?: throw ModException("$name is no longer in ${change.target}.")
+                // A later mod wins over an earlier one for the same entry.
+                writes[index] = File(storedDir, change.stored)
+            }
+            archive.replaceAll(writes)
+        }
+    }
+
+    /**
+     * Keeps the original as `<file>.bk` the first time a mod changes it. A whole
+     * file swap can just rename; an AFS patch edits the archive, so it copies.
+     */
+    private fun ensureBackup(kind: Kind, target: String, patchesInPlace: Boolean) {
+        val file = File(baseFor(kind), target)
+        val backup = File(file.path + BACKUP_SUFFIX)
+        if (backup.exists() || !file.exists()) return
+        if (patchesInPlace) {
+            val tmp = File(backup.path + ".tmp")
+            file.copyTo(tmp, overwrite = true)
+            if (!tmp.renameTo(backup)) throw ModException("Couldn't create ${backup.name}.")
+        } else if (!file.renameTo(backup)) {
+            throw ModException("Couldn't create ${backup.name}.")
+        }
+    }
+
+    private fun checkSpace(changes: List<Change>, staging: File) {
+        var needed = 0L
+        for ((target, group) in changes.groupBy { it.target }) {
+            val file = File(baseFor(group.first().kind), target)
+            val hasBackup = File(file.path + BACKUP_SUFFIX).exists()
+            if (group.any { it.kind == Kind.AFS }) {
+                if (!hasBackup) needed += file.length()
+                needed += group.sumOf { File(staging, it.stored).length() }
+            } else {
+                needed += group.sumOf { File(staging, it.stored).length() }
+            }
+        }
+        val free = gameRoot.usableSpace
+        if (free in 1 until needed + SPACE_MARGIN) {
+            throw ModException(
+                "Not enough free space: this mod needs about ${needed / MB} MB " +
+                    "(including the .bk backups) and ${free / MB} MB is free."
+            )
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Matching
+
+    /** Lower-case relative path → real relative path, for every game file. */
+    private fun indexGameFiles(): Map<String, String> = gameRoot.walkTopDown()
+        .onEnter { it != modsDir && !it.name.startsWith(".") }
+        .filter { it.isFile && !it.name.endsWith(BACKUP_SUFFIX) && !it.name.endsWith(".tmp") }
+        .associate {
+            val rel = it.relativeTo(gameRoot).invariantSeparatorsPath
+            rel.lowercase() to rel
+        }
+
+    /** Every .afs in the game, parsed (or the reason it couldn't be). */
+    private fun readPacks(gameFiles: Collection<String>): Map<String, Result<AfsArchive>> =
+        gameFiles.filter { it.endsWith(".afs", ignoreCase = true) }.sorted()
+            .associateWith { runCatching { AfsArchive.open(File(gameRoot, it)) } }
+
+    /** Entry name (lower case) → (archive path, entry name) for every AFS in the game. */
+    private fun indexAfsEntries(packs: Map<String, Result<AfsArchive>>): Map<String, List<Pair<String, String>>> {
+        val index = mutableMapOf<String, MutableList<Pair<String, String>>>()
+        for ((rel, result) in packs) {
+            // A modded archive still holds the same entry names, so either copy will do.
+            val archive = result.getOrNull() ?: continue
+            for (entry in archive.entries) {
+                if (entry.name.isEmpty()) continue
+                index.getOrPut(AfsArchive.baseName(entry.name).lowercase()) { mutableListOf() } +=
+                    rel to entry.name
+            }
+        }
+        return index
+    }
+
+    /**
+     * The (archive, entry index) the game reads [path] from, by way of the
+     * game's own path hashes. The archive must have as many entries as the
+     * game expects, or the index would point at the wrong file.
+     */
+    private fun locateSlot(
+        path: String,
+        packIndex: PackIndex?,
+        packs: Map<String, Result<AfsArchive>>,
+    ): Pair<String, Int>? {
+        packIndex ?: return null
+        for (logical in PackIndex.candidates(path)) {
+            val slot = packIndex.locate(logical) ?: continue
+            val (rel, archive) = packs.entries.firstOrNull { (rel, _) ->
+                rel.substringAfterLast('/').equals(slot.pack, ignoreCase = true)
+            } ?: continue
+            val entries = archive.getOrNull()?.entries ?: continue
+            if (entries.size != packIndex.entryCount(slot.pack)) continue
+            return rel to slot.index
+        }
+        return null
+    }
+
+    /**
+     * Copies the game's own Xbox 360 files for [slots] (read from the
+     * untouched `.bk` when there is one) into `mods/x360-originals/`, so the
+     * PS3 and Xbox 360 versions of a character can be compared.
+     */
+    private fun exportOriginals(slots: List<Pair<String, Int>>) {
+        if (slots.isEmpty()) return
+        runCatching {
+            val out = File(modsDir, "x360-originals").apply { mkdirs() }
+            for ((rel, index) in slots) {
+                val live = File(gameRoot, rel)
+                val bk = File(live.path + BACKUP_SUFFIX)
+                val source = if (bk.exists()) bk else live
+                val entry = AfsArchive.open(source).entries.getOrNull(index) ?: continue
+                val target = File(out, "${live.name.substringBefore("_pt_")}-$index.zpak")
+                if (target.length() == entry.size) continue
+                java.io.RandomAccessFile(source, "r").use { raf ->
+                    raf.seek(entry.offset)
+                    target.outputStream().use { o ->
+                        val buf = ByteArray(1 shl 16)
+                        var left = entry.size
+                        while (left > 0) {
+                            val n = raf.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+                            if (n < 0) break
+                            o.write(buf, 0, n)
+                            left -= n
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** Short names for versions kept in different folders: what's left after their common start. */
+    private fun versionLabels(stems: List<String>): List<String> {
+        val folders = stems.map { it.substringBeforeLast('/').split('/').filter(String::isNotEmpty) }
+        val common = folders.minOf { it.size }.let { n -> (0 until n).takeWhile { i -> folders.all { it[i] == folders[0][i] } }.size }
+        return folders.mapIndexed { k, f ->
+            f.drop(common).joinToString("/").ifEmpty { stems[k].substringAfterLast('/') }
+        }
+    }
+
+    /**
+     * Older mods ship a character as `IORAM.stpk`, `SPR.stpk` and `VRAM.pak`, one folder per
+     * version, and name the character only inside the packs (`001_goku_1_D_1p_PS3.ioram`).
+     * Those files are renamed in [staging] to the usual `<character>_PS3_<part>.zpak`.
+     */
+    private fun nameByContents(staging: File, paths: List<String>): List<String> {
+        class Found(val path: String, val part: Char, val stem: String?, val ps3: Boolean)
+        val found = paths.mapNotNull { path ->
+            val name = path.substringAfterLast('/')
+            if (PackIndex.characterFile(name) != null) return@mapNotNull null
+            val file = File(staging, path)
+            if (file.length() !in 64..MAX_NAMED_PACK) return@mapNotNull null
+            val head = ByteArray(4).also { b -> file.inputStream().use { it.read(b) } }.toString(Charsets.ISO_8859_1)
+            if (head != "STPK" && head != "STPZ") return@mapNotNull null
+            val inner = runCatching { Ps3Converter.entryNames(file.readBytes()) }.getOrNull() ?: return@mapNotNull null
+            val first = inner.firstOrNull() ?: return@mapNotNull null
+            val character = PackIndex.characterFile(first)
+            val base = name.substringBeforeLast('.').lowercase()
+            val part = when {
+                first.endsWith(".ioram", true) || inner.all { it.endsWith(".ioram", true) } -> 'i'
+                inner.any { it.endsWith(".spr", true) } -> 'm'
+                first.endsWith(".vram", true) -> 'v'
+                base.contains("ioram") -> 'i'
+                base.contains("vram") -> 'v'
+                base.contains("spr") || base.contains("model") -> 'm'
+                else -> return@mapNotNull null
+            }
+            Found(path, part, character?.stem, first.contains("_PS3", ignoreCase = true))
+        }
+        if (found.isEmpty()) return paths
+        val renamed = HashMap<String, String>()
+        for ((folder, files) in found.groupBy { it.path.substringBeforeLast('/', "") }) {
+            // A pack whose own name is off (`0001_goku_...`) takes the character its folder names.
+            val stems = files.mapNotNull { it.stem }.distinct()
+            for (f in files) {
+                val stem = f.stem ?: stems.singleOrNull() ?: continue
+                val letter = if (f.part == 'm') 's' else f.part
+                val target = (if (folder.isEmpty()) "" else "$folder/") +
+                    stem + (if (f.ps3 || files.any { it.ps3 }) "_PS3" else "") + "_$letter.zpak"
+                if (target in paths || target in renamed.values) continue
+                if (File(staging, f.path).renameTo(File(staging, target))) renamed[f.path] = target
+            }
+        }
+        return paths.map { renamed[it] ?: it }
+    }
+
+    /** True when a pack's own file names say it is PS3 data (`000_goku_0_2p_PS3.spr`). */
+    private fun looksPs3(file: File): Boolean = file.name.contains("_PS3", ignoreCase = true) || runCatching {
+        val head = ByteArray(minOf(512L, file.length()).toInt())
+        file.inputStream().use { it.read(head) }
+        String(head, Charsets.ISO_8859_1).let { it.startsWith("SPRP") || it.contains("_PS3.") || it.contains("_PS3-") }
+    }.getOrDefault(false)
+
+    /** The game's own entry for [slot] (from the untouched `.bk` when there is one). */
+    private fun originalEntry(slot: Pair<String, Int>): ByteArray? = runCatching {
+        val live = File(gameRoot, slot.first)
+        val bk = File(live.path + BACKUP_SUFFIX)
+        val source = if (bk.exists()) bk else live
+        val entry = AfsArchive.open(source).entries.getOrNull(slot.second) ?: return@runCatching null
+        java.io.RandomAccessFile(source, "r").use { raf ->
+            ByteArray(entry.size.toInt()).also { raf.seek(entry.offset); raf.readFully(it) }
+        }
+    }.getOrNull()
+
+    /**
+     * Writes `install-report.txt`: for each pack entry the mod replaces, the
+     * first bytes of the game's original and of the mod's file, so a format
+     * mismatch can be spotted.
+     */
+    private fun writeInstallReport(changes: List<Change>, staging: File) {
+        runCatching {
+            File(modsDir, "install-report.txt").writeText(buildString {
+                for (c in changes) {
+                    appendLine("${c.kind} ${c.target} ${c.entry ?: ""} <- ${c.stored}")
+                    if (c.kind != Kind.AFS) continue
+                    val file = File(gameRoot, c.target)
+                    val archive = AfsArchive.open(file)
+                    val name = c.entry!!
+                    val entry = if (name.startsWith("#")) archive.entries.getOrNull(name.drop(1).toInt())
+                    else archive.find(name)
+                    if (entry != null) {
+                        appendLine("  original: ${entry.size} bytes: ${headDump(file, entry.offset, 96)}")
+                    }
+                    val mod = File(staging, c.stored)
+                    appendLine("  mod: ${mod.length()} bytes: ${headDump(mod, 0, 96)}")
+                }
+            })
+        }
+    }
+
+    private fun headDump(file: File, offset: Long, n: Int): String = runCatching {
+        java.io.RandomAccessFile(file, "r").use { raf ->
+            val b = ByteArray(minOf(n.toLong(), raf.length() - offset).toInt())
+            raf.seek(offset)
+            raf.readFully(b)
+            b.joinToString(" ") { "%02x".format(it) } + "  |" +
+                b.map { val c = it.toInt() and 0xFF; if (c in 32..126) c.toChar() else '.' }.joinToString("") + "|"
+        }
+    }.getOrDefault("unreadable")
+
+    /** Every DB_SAVE in the saves folder, relative to it (one per profile). */
+    private fun findSaves(): List<String> {
+        val dir = savesDir ?: return emptyList()
+        if (!dir.isDirectory) return emptyList()
+        return dir.walkTopDown()
+            .filter { it.isFile && it.name.equals("DB_SAVE", ignoreCase = true) }
+            .map { it.relativeTo(dir).invariantSeparatorsPath }
+            .toList()
+    }
+
+    /**
+     * Writes `pack-report.txt` (what each .afs looked like to the installer) and
+     * returns a one-line summary per pack, so a failed match can be diagnosed.
+     */
+    private fun writePackReport(packs: Map<String, Result<AfsArchive>>): String {
+        val lines = packs.map { (rel, result) ->
+            val name = rel.substringAfterLast('/')
+            result.fold(
+                onSuccess = { a ->
+                    val named = a.entries.count { it.name.isNotEmpty() }
+                    "$name: ${a.entries.size} entries, $named named, ${a.order}, align ${a.alignment}" +
+                        (a.entries.firstOrNull { it.name.isNotEmpty() }?.let { ", e.g. ${it.name}" } ?: "")
+                },
+                onFailure = { "$name: ${it.message}" }
+            )
+        }
+        runCatching {
+            modsDir.mkdirs()
+            File(modsDir, "pack-report.txt").writeText(buildString {
+                for ((rel, result) in packs) {
+                    appendLine("$rel header: ${AfsArchive.headerHex(File(gameRoot, rel))}")
+                    val a = result.getOrNull() ?: continue
+                    appendLine("  name table at ${a.nameTableOffset} size ${a.nameTableSize}")
+                    appendLine("  first records: ${a.nameTableHex()}")
+                    appendLine("  first names: " + a.entries.take(12).joinToString(" | ") { it.name })
+                    val goku = a.entries.filter { it.name.contains("goku", ignoreCase = true) }.take(12)
+                    if (goku.isNotEmpty()) {
+                        appendLine("  goku names: " + goku.joinToString(" | ") { "${it.index}:${it.name}" })
+                    }
+                }
+                lines.forEach { appendLine(it) }
+            })
+        }
+        return if (lines.isEmpty()) "No .afs packs found in the game folder." else
+            "Packs: " + lines.joinToString("; ")
+    }
+
+    private fun baseFor(kind: Kind): File = if (kind == Kind.SAVE) {
+        savesDir ?: throw ModException("No saves folder.")
+    } else {
+        gameRoot
+    }
+
+    /** The longest tail of [path] that is a game file, as the game spells it. */
+    private fun matchFile(path: String, gameIndex: Map<String, String>): String? {
+        val parts = path.split('/')
+        for (start in parts.indices) {
+            val tail = parts.subList(start, parts.size).joinToString("/").lowercase()
+            gameIndex[tail]?.let { return it }
+        }
+        return null
+    }
+
+    private fun isJunk(path: String): Boolean {
+        val lower = path.lowercase()
+        val name = lower.substringAfterLast('/')
+        return lower.startsWith("__macosx/") || name == ".ds_store" || name == "thumbs.db" ||
+            JUNK_EXTENSIONS.any { name.endsWith(it) }
+    }
+
+    private fun isSave(path: String): Boolean {
+        val lower = path.lowercase()
+        return lower.substringAfterLast('/') == "db_save" || lower.split('/').contains("savedata")
+    }
+
+    // ------------------------------------------------------------------
+    // Files
+
+    /** Unzips into [dir] and returns the relative paths of the files. Rejects paths leaving [dir]. */
+    private fun extractZip(input: InputStream, dir: File): List<String> {
+        dir.mkdirs()
+        val root = dir.canonicalFile
+        val paths = mutableListOf<String>()
+        ZipInputStream(input.buffered()).use { zis ->
+            while (true) {
+                val entry = zis.nextEntry ?: break
+                val name = entry.name.replace('\\', '/').trimStart('/')
+                if (entry.isDirectory || name.isEmpty()) continue
+                val out = File(root, name).canonicalFile
+                if (!out.path.startsWith(root.path + File.separator)) {
+                    throw ModException("The zip has an unsafe path: ${entry.name}")
+                }
+                out.parentFile?.mkdirs()
+                out.outputStream().use { zis.copyTo(it) }
+                paths += out.relativeTo(root).invariantSeparatorsPath
+            }
+        }
+        return paths
+    }
+
+    private fun copyAtomically(source: File, target: File) {
+        target.parentFile?.mkdirs()
+        val tmp = File(target.path + ".tmp")
+        source.copyTo(tmp, overwrite = true)
+        if (target.exists() && !target.delete()) throw ModException("Couldn't replace ${target.name}.")
+        if (!tmp.renameTo(target)) throw ModException("Couldn't write ${target.name}.")
+    }
+
+    private fun uniqueId(name: String, records: List<InstalledMod>): String {
+        val base = name.substringBeforeLast('.').lowercase()
+            .replace(Regex("[^a-z0-9]+"), "-").trim('-').ifEmpty { "mod" }.take(40)
+        var id = base
+        var n = 2
+        while (records.any { it.id == id } || File(modsDir, id).exists()) id = "$base-${n++}"
+        return id
+    }
+
+    // ------------------------------------------------------------------
+    // Records: one tab-separated line per fact, in install order.
+
+    private fun readRecords(): List<InstalledMod> {
+        if (!recordFile.exists()) return emptyList()
+        val mods = linkedMapOf<String, Triple<String, MutableList<Change>, MutableList<Skipped>>>()
+        for (line in recordFile.readLines()) {
+            val f = line.split('\t')
+            when (f.firstOrNull()) {
+                "mod" -> if (f.size >= 3) mods[f[1]] = Triple(f[2], mutableListOf(), mutableListOf())
+                "change" -> if (f.size >= 6) mods[f[1]]?.second?.add(
+                    Change(Kind.valueOf(f[2]), f[3], f[4].takeIf { it != "-" }, f[5])
+                )
+                "skip" -> if (f.size >= 4) mods[f[1]]?.third?.add(Skipped(f[2], f[3]))
+            }
+        }
+        return mods.map { (id, v) -> InstalledMod(id, v.first, v.second, v.third) }
+    }
+
+    private fun writeRecords(mods: List<InstalledMod>) {
+        modsDir.mkdirs()
+        val text = buildString {
+            for (mod in mods) {
+                appendLine("mod\t${mod.id}\t${clean(mod.name)}")
+                for (c in mod.changes) {
+                    appendLine("change\t${mod.id}\t${c.kind}\t${c.target}\t${c.entry ?: "-"}\t${c.stored}")
+                }
+                for (s in mod.skipped) appendLine("skip\t${mod.id}\t${clean(s.path)}\t${clean(s.reason)}")
+            }
+        }
+        val tmp = File(recordFile.path + ".tmp")
+        tmp.writeText(text)
+        if (recordFile.exists()) recordFile.delete()
+        if (!tmp.renameTo(recordFile)) throw ModException("Couldn't save the mod list.")
+    }
+
+    private fun clean(s: String) = s.replace('\t', ' ').replace('\n', ' ')
+
+    companion object {
+        const val BACKUP_SUFFIX = ".bk"
+        private const val UNMATCHED = "doesn't match any game file"
+        /** Largest pack opened to read the character name inside it. */
+        private const val MAX_NAMED_PACK = 64L shl 20
+        private const val NO_INDEX = "the game hasn't been started yet, so its character file list isn't known"
+        private const val MB = 1024L * 1024L
+        private const val SPACE_MARGIN = 64L * MB
+        private val JUNK_EXTENSIONS = listOf(
+            ".txt", ".md", ".url", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".html", ".ini.bak",
+        )
+    }
+}
